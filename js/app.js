@@ -173,6 +173,30 @@
             if (state.participants.includes(currPerson) || currPerson === 'all') personSelect.value = currPerson;
             if (state.participants.includes(currPayer) || currPayer === 'all') payerSelect.value = currPayer;
         });
+
+        // Populate Timeline multi-select participant checkboxes
+        const histContainer = document.getElementById('hist-filter-participant-checkboxes');
+        if (histContainer) {
+            const savedChecked = {};
+            histContainer.querySelectorAll('.hist-filter-chk').forEach(chk => {
+                savedChecked[chk.getAttribute('data-name')] = chk.checked;
+            });
+            
+            histContainer.innerHTML = state.participants.map(p => {
+                const isChecked = savedChecked[p] !== undefined ? savedChecked[p] : true;
+                return `
+                    <label class="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-50/50 border border-indigo-200 rounded-md text-xs font-medium text-indigo-900 cursor-pointer hover:bg-indigo-100 transition-colors select-none">
+                        <input type="checkbox" data-name="${p}" ${isChecked ? 'checked' : ''} onchange="renderHistory()" class="hist-filter-chk w-3.5 h-3.5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">
+                        <span>${p}${p === state.userName ? ' (You)' : ''}</span>
+                    </label>
+                `;
+            }).join('');
+        }
+    }
+
+    function selectAllHistFilterParticipants(selectAll) {
+        document.querySelectorAll('.hist-filter-chk').forEach(chk => chk.checked = selectAll);
+        renderHistory();
     }
 
     function clearFilters(viewPrefix) {
@@ -183,6 +207,10 @@
         document.getElementById(`${viewPrefix}-filter-month`).value = '';
         document.getElementById(`${viewPrefix}-filter-date`).value = '';
         
+        if (viewPrefix === 'hist') {
+            document.querySelectorAll('.hist-filter-chk').forEach(chk => chk.checked = true);
+        }
+
         if (viewPrefix === 'dash') renderDashboard();
         if (viewPrefix === 'hist') renderHistory();
     }
@@ -194,6 +222,15 @@
         const filterPayer = document.getElementById(`${viewPrefix}-filter-payer`).value;
         const filterMonth = document.getElementById(`${viewPrefix}-filter-month`).value;
         const filterDate = document.getElementById(`${viewPrefix}-filter-date`).value;
+
+        let checkedFilterPersons = null;
+        if (viewPrefix === 'hist') {
+            const chks = document.querySelectorAll('.hist-filter-chk:checked');
+            const totalChks = document.querySelectorAll('.hist-filter-chk');
+            if (totalChks.length > 0 && chks.length < totalChks.length) {
+                checkedFilterPersons = Array.from(chks).map(c => c.getAttribute('data-name'));
+            }
+        }
 
         return expenseList.filter(exp => {
             // Search Match
@@ -214,7 +251,13 @@
             let matchMonth = !filterMonth || exp.date.startsWith(filterMonth);
             let matchDate = !filterDate || exp.date.startsWith(filterDate);
 
-            return matchSearch && matchCat && matchPerson && matchPayer && matchMonth && matchDate;
+            // Participant Filter Checkboxes
+            let matchFilterPersons = true;
+            if (checkedFilterPersons) {
+                matchFilterPersons = checkedFilterPersons.some(p => exp.paidBy === p || (exp.splits && exp.splits[p] !== undefined && exp.splits[p] > 0));
+            }
+
+            return matchSearch && matchCat && matchPerson && matchPayer && matchMonth && matchDate && matchFilterPersons;
         });
     }
 
@@ -655,6 +698,43 @@
                     attachmentsHtml += `</div>`;
                 }
 
+                let splitCheckboxesHtml = '';
+                if (state.participants && state.participants.length > 0) {
+                    splitCheckboxesHtml = `
+                        <div class="mt-3 pt-3 border-t border-gray-100 bg-gray-50/80 p-2.5 rounded-lg">
+                            <div class="flex justify-between items-center mb-2">
+                                <span class="text-xs font-bold text-gray-700 uppercase tracking-wider flex items-center gap-1">
+                                    <svg class="w-3.5 h-3.5 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
+                                    Split Among:
+                                </span>
+                                <div class="space-x-1 text-[11px]">
+                                    <button type="button" onclick="selectAllTimelineExpenseParticipants(${exp.id}, true)" class="text-indigo-600 font-semibold hover:underline">Select All</button>
+                                    <span class="text-gray-300">|</span>
+                                    <button type="button" onclick="selectAllTimelineExpenseParticipants(${exp.id}, false)" class="text-indigo-600 font-semibold hover:underline">Clear</button>
+                                </div>
+                            </div>
+                            <div class="flex flex-wrap gap-1.5">
+                    `;
+
+                    state.participants.forEach(p => {
+                        const isChecked = exp.splits && exp.splits[p] !== undefined && exp.splits[p] > 0;
+                        const shareVal = isChecked ? exp.splits[p] : 0;
+                        
+                        splitCheckboxesHtml += `
+                            <label class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium cursor-pointer transition-all select-none ${isChecked ? 'bg-indigo-50 border-indigo-200 text-indigo-900 shadow-sm font-semibold' : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-100'}">
+                                <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleTimelineParticipantSplit(${exp.id}, '${p}', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500 cursor-pointer">
+                                <span>${p}${p === state.userName ? ' (You)' : ''}</span>
+                                ${isChecked ? `<span class="text-[11px] text-indigo-600 font-bold ml-0.5">${formatMoney(shareVal)}</span>` : ''}
+                            </label>
+                        `;
+                    });
+
+                    splitCheckboxesHtml += `
+                            </div>
+                        </div>
+                    `;
+                }
+
                 const isSettled = !!exp.settled;
 
                 list.innerHTML += `
@@ -684,12 +764,65 @@
                                 <p class="text-xs text-gray-500 mb-2 mt-1"><span class="bg-gray-100 px-2 py-0.5 rounded text-gray-600">${exp.category}</span></p>
                                 <p class="text-sm text-gray-600"><span class="font-medium">${exp.paidBy === state.userName ? 'You' : exp.paidBy}</span> paid <span class="font-semibold text-indigo-600">${formatMoney(exp.amount)}</span></p>
                                 ${attachmentsHtml}
+                                ${splitCheckboxesHtml}
                             </div>
                         </div>
                     </div>
                 `;
             });
         }
+    }
+
+    async function toggleTimelineParticipantSplit(expId, participantName, isChecked) {
+        const exp = expenses.find(e => e.id === expId);
+        if (!exp) return;
+
+        if (!exp.splits) exp.splits = {};
+
+        const currentlyChecked = state.participants.filter(p => {
+            if (p === participantName) return isChecked;
+            return exp.splits[p] !== undefined && exp.splits[p] > 0;
+        });
+
+        if (currentlyChecked.length === 0) {
+            alert("At least one participant must be selected to split the bill.");
+            renderHistory();
+            return;
+        }
+
+        const newSplits = {};
+        const share = exp.amount / currentlyChecked.length;
+        currentlyChecked.forEach(p => {
+            newSplits[p] = share;
+        });
+
+        exp.splits = newSplits;
+        exp.splitMethod = 'equal';
+
+        await dbSaveExpense(exp);
+        updateAllViews();
+    }
+
+    async function selectAllTimelineExpenseParticipants(expId, selectAll) {
+        const exp = expenses.find(e => e.id === expId);
+        if (!exp) return;
+
+        if (!selectAll) {
+            alert("At least one participant must be selected for the bill split.");
+            return;
+        }
+
+        const newSplits = {};
+        const share = exp.amount / state.participants.length;
+        state.participants.forEach(p => {
+            newSplits[p] = share;
+        });
+
+        exp.splits = newSplits;
+        exp.splitMethod = 'equal';
+
+        await dbSaveExpense(exp);
+        updateAllViews();
     }
 
     async function toggleSettled(id) {
