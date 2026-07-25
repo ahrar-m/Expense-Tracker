@@ -1,0 +1,55 @@
+/* Custom scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f5f9; }
+        ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: #94a3b8; }
+        .hide { display: none !important; }
+        
+        /* Layout & Scrolling Fixes for Mobile/Android */
+        html, body {
+            margin: 0;
+            padding: 0;
+            height: 100%;
+            overflow: hidden; /* Prevent body scroll, let content area scroll */
+            background-color: #f3f4f6;
+        }
+        
+        .app-container { 
+            max-width: 600px; 
+            margin: 0 auto; 
+            background-color: #ffffff; 
+            height: 100dvh; /* Dynamic viewport height handles browser address bars */
+            display: flex; 
+            flex-direction: column; 
+            box-shadow: 0 0 15px rgba(0,0,0,0.05); 
+            position: relative;
+        }
+        
+        @supports not (height: 100dvh) {
+            .app-container { height: 100vh; }
+        }
+
+        .content-area { 
+            flex: 1; 
+            overflow-y: auto; 
+            padding: 1rem;
+            padding-bottom: 120px; /* Extra padding so bottom items aren't hidden by nav */
+        }
+        
+        .bottom-nav { 
+            position: absolute; 
+            bottom: 0; 
+            left: 0;
+            right: 0;
+            width: 100%; 
+            background: white; 
+            border-top: 1px solid #e5e7eb; 
+            display: flex; 
+            justify-content: space-around; 
+            padding: 0.75rem 0; 
+            z-index: 50; 
+            padding-bottom: calc(0.75rem + env(safe-area-inset-bottom));
+        }
+        
+        /* Image Viewer Modal */
+        #image-viewer { backdrop-filter: blur(4px); }
