@@ -7,10 +7,12 @@ No backend. Everything is stored locally in IndexedDB.
 ## What is in this version
 
 * **Bills are first-class.** The main page lists compact bill cards; tap one to expand it into its items, edit them, settle the bill or delete the whole thing.
+* **The split is visible before you expand.** Every collapsed bill card shows each person's total share, plus an "Unallocated" warning if the visible item shares do not add up to the bill total.
 * **Every item is split separately.** Each item has its own people list and its own split method: Equal, Weights, Percentages, Custom amounts or Bill ratio.
 * **Bill-ratio rows follow the bill by default.** Rows that look like tax, service charge, tip, delivery fee, discount, coupon, adjustment or round-off start in Bill ratio, so each person pays the same proportion as their share of the bill's normal items. Bill ratio is also available for any ordinary item, both while adding a bill and in the item editor.
 * **Categories start empty.** There are no seeded Food/Travel/Stay defaults. Each bill owns its own categories, created fresh when you type one or when an imported CSV brings one in.
 * **AI import carries splits.** Split With accepts plain names, weights (Ali:2;Sara:1) and percentages (Ali:60%;Sara:40%), and every item has mode buttons in the preview.
+* **Themed dialogs.** Validation, destructive confirmations and success messages use in-app SplitTrack dialogs and toasts instead of Android/system alert popups.
 * **Fresh storage.** This build uses a new database (SplitTrackDB). Data from the old ExpenseTrackerDB version is not migrated.
 
 ## How to use it
@@ -19,7 +21,7 @@ No backend. Everything is stored locally in IndexedDB.
 2. **Add a bill** from the Add Bill tab: give it a name (for example "Spice Route dinner"), a date and the payer. No payer is preselected - choose one explicitly every time.
 3. **Add items** inside that bill. Each item gets a name, an amount, a category you type yourself, and its own row of people chips. Ticked people share that item equally by default; unticked people are skipped. Tax, discount, adjustment and round-off rows switch to Bill ratio automatically when you save, and the per-row Equal / Bill ratio selector lets you put any item on bill ratio immediately.
 4. **Adjust a split** by tapping an item in the Bills tab: pick Equal, Weights, Percentages, Custom or Ratio. Weights, percentages and custom amounts show a live share per person and block invalid totals.
-5. **Review bills** in the Bills tab. Each card shows the total, the payer, the item count and everyone involved. Tap to expand and see each item with every person's exact share.
+5. **Review bills** in the Bills tab. Each collapsed card already shows the payer, the bill total and each person's share; an amber "Unallocated" chip appears if the shown item splits do not add up to the total. Tap to expand and see each item with every person's exact share.
 6. **Settle up**: the check icon on an item marks just that item; "Settle all" marks the whole bill. Settled items are excluded from "who owes whom" but stay in the charts and history.
 
 Every bill has one payer, and new bills start with no payer selected so the choice is never accidental. Changing the payer in Edit bill updates every item in that bill.
@@ -73,12 +75,19 @@ Rules:
 
 Storage lives in IndexedDB under SplitTrackDB. Clearing site data in the browser deletes everything, so keep JSON backups.
 
+## PDF statement
+
+Open the **Bills** tab and tap the small **PDF** button in its header, or go to **Settings → Export Data → Export PDF**. SplitTrack opens a themed, full-screen preview of the statement inside the app (no popup or new tab); **Close**, the backdrop or Escape dismisses it without printing.
+
+Choose **Save as PDF** to open the browser's print dialog and pick a PDF destination or printer. The statement covers every bill and item with each person's share, the payer, categories, settlement status and reconciliation checks, so it can be reviewed or filed alongside the CSV and JSON exports. A 1-paise display-rounding note is included wherever the visible two-decimal shares cannot add up exactly, instead of silently hiding the difference.
+
 ## Architecture
 
 * Pure client-side HTML/CSS/vanilla JS.
 * IndexedDB stores: metadata (settings), projects (bills), items (expense lines).
 * Item splits are computed and stored as a per-person amount map; the raw weights/percentages/amounts are kept in splitInputs so the editor can reopen exactly what you typed.
 * Tailwind is vendored for offline styling, Chart.js for the dashboard charts.
+* `js/pdf-report.js` renders the scoped statement used by the in-app preview and the hidden print root; `js/app-dialog.js` provides the themed dialogs and toasts.
 * No build step, no server.
 
 ## File structure
@@ -90,6 +99,8 @@ Expense-Tracker/
 ├── css/style.css
 └── js/
     ├── app.js          # State, IndexedDB, bills, splits, importer, charts
+    ├── app-dialog.js   # Themed alert/confirm dialogs and toasts
+    ├── pdf-report.js   # Print-ready PDF statement renderer
     └── vendor/
         ├── chart.js
         └── tailwind.js

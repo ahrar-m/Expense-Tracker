@@ -59,3 +59,24 @@
         
         /* Image Viewer Modal */
         #image-viewer { backdrop-filter: blur(4px); }
+
+        /* PDF statement preview */
+        .pdf-print-root { display: none; }
+
+        #pdf-preview-container {
+            background: #ffffff;
+            border-radius: 0.5rem;
+            box-shadow: 0 10px 30px rgba(15, 23, 42, 0.12);
+        }
+
+        #pdf-preview-container:empty { display: none; }
+
+        @media print {
+            html, body { height: auto !important; overflow: visible !important; background: #fff !important; }
+            body.pdf-printing .app-container,
+            body.pdf-printing .bottom-nav,
+            body.pdf-printing #modal-pdf,
+            body.pdf-printing #app-dialog,
+            body.pdf-printing #app-toast-stack { display: none !important; }
+            body.pdf-printing .pdf-print-root { display: block !important; }
+        }

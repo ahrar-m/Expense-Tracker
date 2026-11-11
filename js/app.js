@@ -62,6 +62,9 @@ let importBills = [];
 let importDefaultParticipants = [];
 let chartInstances = { date: null, people: null, category: null };
 let idSeq = 0;
+let pdfReportData = null;
+let pdfReturnFocus = null;
+let pdfPreviousBodyOverflow = null;
 
 /* ------------------------- small helpers ------------------------- */
 
@@ -1158,7 +1161,7 @@ async function saveBill(event) {
     resetAddForm();
     switchView('history');
     updateAllViews();
-    alert('Saved "' + name + '" with ' + drafts.length + ' item(s).');
+    appToast('Saved "' + name + '" with ' + drafts.length + ' item(s).', 'success');
   } catch (err) {
     alert('Could not save the bill: ' + err.message);
   }
@@ -1560,28 +1563,52 @@ async function saveItemModal(event) {
 
 /* --------------------------- timeline ---------------------------- */
 
-function involvedPeople(project, projectItems) {
-  const names = [];
-  function add(name) {
-    if (!name) return;
-    if (!names.some(function (existing) { return samePerson(existing, name); })) names.push(name);
-  }
-  add(project.payer);
-  projectItems.forEach(function (item) {
-    if (item.splits) Object.keys(item.splits).forEach(add);
+function billSplitChipsHtml(projectItems, displayTotal, filtered) {
+  const totals = {};
+  (projectItems || []).forEach(function (item) {
+    const splits = item.splits || {};
+    Object.keys(splits).forEach(function (person) {
+      const value = Number(splits[person]) || 0;
+      if (!Object.prototype.hasOwnProperty.call(totals, person)) totals[person] = 0;
+      totals[person] += value;
+    });
   });
-  return names;
-}
 
-function personChips(names, limit) {
-  const max = limit || 4;
-  let html = names.slice(0, max).map(function (name) {
-    return '<span class="inline-flex items-center px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-[10px] font-medium border border-indigo-100">' +
-      esc(name === state.userName ? 'You' : name) + '</span>';
-  }).join('');
-  if (names.length > max) {
-    html += '<span class="text-[10px] text-gray-400">+' + (names.length - max) + '</span>';
+  const names = [];
+  state.participants.forEach(function (person) {
+    if (Object.prototype.hasOwnProperty.call(totals, person)) names.push(person);
+  });
+  Object.keys(totals).forEach(function (person) {
+    if (!names.some(function (existing) { return samePerson(existing, person); })) names.push(person);
+  });
+
+  const rows = names.filter(function (person) { return Math.abs(totals[person]) > 0.004; });
+  if (!rows.length) {
+    return '<p class="text-[10px] text-gray-400 mt-2">No splits set for this bill.</p>';
   }
+
+  const shareTotal = Object.keys(totals).reduce(function (sum, person) { return sum + totals[person]; }, 0);
+  const gap = (Number(displayTotal) || 0) - shareTotal;
+
+  let html = '<div class="mt-2">' +
+    '<p class="text-[9px] font-bold uppercase tracking-wider text-gray-400 mb-1">Bill split' +
+      (filtered ? ' <span class="normal-case font-medium tracking-normal text-gray-400">(shown items)</span>' : '') +
+    '</p>' +
+    '<div class="flex flex-wrap gap-1">';
+
+  rows.forEach(function (person) {
+    const amount = totals[person];
+    html += '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-indigo-50 border border-indigo-100 text-[10px] text-indigo-800">' +
+      esc(person === state.userName ? 'You' : person) +
+      ' <b class="' + (amount < 0 ? 'text-emerald-700' : 'text-indigo-900') + '">' + money(amount) + '</b></span>';
+  });
+
+  if (Math.abs(gap) > 0.01) {
+    html += '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-50 border border-amber-200 text-[10px] font-semibold text-amber-700">' +
+      (gap > 0 ? 'Unallocated ' : 'Overallocated ') + money(Math.abs(gap)) + '</span>';
+  }
+
+  html += '</div></div>';
   return html;
 }
 
@@ -1638,7 +1665,6 @@ function billCardHtml(project, matchedItems) {
   const allSettled = allItems.length > 0 && allItems.every(function (it) { return !!it.settled; });
   const someSettled = !allSettled && allItems.some(function (it) { return !!it.settled; });
   const expanded = expandedProjectIds.has(project.id);
-  const people = involvedPeople(project, allItems);
   const sortedItems = matchedItems.slice().sort(function (a, b) {
     return (Number(a.order) || 0) - (Number(b.order) || 0);
   });
@@ -1662,7 +1688,7 @@ function billCardHtml(project, matchedItems) {
           '<h4 class="font-bold text-gray-800 text-base break-words">' + esc(project.name) + '</h4>' + badge +
         '</div>' +
         '<p class="text-[11px] text-gray-500 mt-1">' + metaLine + '</p>' +
-        '<div class="flex flex-wrap gap-1 mt-2">' + personChips(people, 4) + '</div>' +
+        billSplitChipsHtml(sortedItems, isSubset ? total : allTotal, isSubset) +
       '</div>' +
       '<div class="text-right flex-shrink-0 pl-1">' +
         '<p class="font-bold text-indigo-600 text-base">' + money(isSubset ? total : allTotal) + '</p>' +
@@ -1756,7 +1782,11 @@ async function toggleProjectSettled(projectId) {
 async function deleteItem(itemId) {
   const item = items.find(function (i) { return i.id === itemId; });
   if (!item) return;
-  if (!confirm('Delete item "' + item.description + '"?')) return;
+  if (!(await appConfirm('Delete item "' + item.description + '"?', {
+    title: 'Delete item?',
+    confirmLabel: 'Delete',
+    danger: true
+  }))) return;
 
   await dbDelete(STORE_ITEMS, item.id);
   items = items.filter(function (i) { return i.id !== item.id; });
@@ -1776,7 +1806,11 @@ async function deleteProject(projectId) {
   const project = projectById(projectId);
   if (!project) return;
   const own = itemsOfProject(projectId);
-  if (!confirm('Delete bill "' + project.name + '" and its ' + own.length + ' item(s)?')) return;
+  if (!(await appConfirm('Delete bill "' + project.name + '" and its ' + own.length + ' item(s)?', {
+    title: 'Delete bill?',
+    confirmLabel: 'Delete',
+    danger: true
+  }))) return;
 
   for (const item of own) await dbDelete(STORE_ITEMS, item.id);
   await dbDelete(STORE_PROJECTS, projectId);
@@ -2124,7 +2158,7 @@ async function saveUserName() {
   state.userName = newName;
   await saveMeta();
   updateAllViews();
-  alert('Name updated.');
+  appToast('Name updated.', 'success');
 }
 
 async function saveCurrency() {
@@ -2134,7 +2168,7 @@ async function saveCurrency() {
   state.currency = next;
   await saveMeta();
   updateAllViews();
-  alert('Currency updated.');
+  appToast('Currency updated.', 'success');
 }
 
 function csvCell(value) {
@@ -2187,8 +2221,260 @@ function exportFullBackup() {
   downloadText(JSON.stringify(backup), 'SplitTrack_Backup_' + todayStr() + '.json', 'application/json');
 }
 
+/* -------------------------- PDF statement ------------------------ */
+
+function getPdfReportApi() {
+  if (typeof window === 'undefined') return null;
+  const api = window.SplitTrackPdfReport;
+  if (!api) return null;
+  if (typeof api.renderInto === 'function') return api;
+  if (typeof api.buildStandaloneHtml === 'function') return api;
+  return null;
+}
+
+function pdfErrorMessage(err) {
+  return err && err.message ? err.message : 'unknown error';
+}
+
+function pdfContainerHasReport(container) {
+  return !!(container && (container.querySelector('.pdf-report') || container.children.length));
+}
+
+function renderPdfReportInto(container, data, api) {
+  if (!container) throw new Error('Missing PDF container.');
+
+  container.innerHTML = '';
+  if (typeof api.renderInto === 'function') {
+    api.renderInto(container, data);
+  } else if (typeof api.buildStandaloneHtml === 'function') {
+    // Optional fallback for a PDF module that only exposes standalone HTML.
+    const standalone = api.buildStandaloneHtml(data);
+    if (typeof standalone !== 'string' || !standalone.trim()) {
+      throw new Error('The PDF report module returned no standalone HTML.');
+    }
+    container.innerHTML = standalone;
+  } else {
+    throw new Error('The PDF report module has no renderer.');
+  }
+
+  if (!container.children.length && !container.textContent.trim()) {
+    throw new Error('The PDF report module returned no content.');
+  }
+}
+
+function exportPdfReport() {
+  if (!projects.length) {
+    return alert('Add at least one bill before exporting a PDF statement.');
+  }
+
+  const api = getPdfReportApi();
+  if (!api) {
+    return alert('PDF export is unavailable because the PDF report module (js/pdf-report.js) did not load correctly. Reload the app and try again.');
+  }
+
+  const preview = $('pdf-preview-container');
+  const printRoot = $('pdf-print-root');
+  const modal = $('modal-pdf');
+  if (!preview || !printRoot || !modal) {
+    return alert('The PDF preview could not open because the page is missing its PDF containers.');
+  }
+
+  const data = {
+    projects: projects,
+    items: items.map(function (item) {
+      return Object.assign({}, item, { kind: detectItemKind(item.description, item.category) });
+    }),
+    participants: state.participants.slice(),
+    userName: state.userName,
+    currency: state.currency,
+    generatedAt: new Date().toISOString()
+  };
+
+  try {
+    renderPdfReportInto(preview, data, api);
+    renderPdfReportInto(printRoot, data, api);
+  } catch (err) {
+    preview.innerHTML = '';
+    printRoot.innerHTML = '';
+    pdfReportData = null;
+    console.error('PDF statement render failed:', err);
+    return alert('Could not build the PDF statement: ' + pdfErrorMessage(err));
+  }
+
+  pdfReportData = data;
+
+  if (modal.classList.contains('hide')) {
+    const activeElement = document.activeElement;
+    pdfReturnFocus = activeElement && activeElement !== document.body && activeElement !== document.documentElement
+      ? activeElement
+      : null;
+  }
+  modal.classList.remove('hide');
+  document.body.classList.add('pdf-printing');
+
+  if (pdfPreviousBodyOverflow === null) {
+    pdfPreviousBodyOverflow = document.body.style.overflow;
+  }
+  document.body.style.overflow = 'hidden';
+
+  const scrollArea = $('pdf-preview-scroll');
+  if (scrollArea) scrollArea.scrollTop = 0;
+
+  const closeButton = $('pdf-modal-close-btn');
+  if (closeButton) {
+    try {
+      closeButton.focus({ preventScroll: true });
+    } catch (err) {
+      closeButton.focus();
+    }
+  }
+}
+
+function closePdfPreview() {
+  const modal = $('modal-pdf');
+  if (modal) modal.classList.add('hide');
+
+  document.body.classList.remove('pdf-printing');
+
+  const preview = $('pdf-preview-container');
+  if (preview) preview.innerHTML = '';
+
+  const printRoot = $('pdf-print-root');
+  if (printRoot) printRoot.innerHTML = '';
+
+  const scrollArea = $('pdf-preview-scroll');
+  if (scrollArea) scrollArea.scrollTop = 0;
+
+  pdfReportData = null;
+
+  if (pdfPreviousBodyOverflow !== null) {
+    document.body.style.overflow = pdfPreviousBodyOverflow;
+    pdfPreviousBodyOverflow = null;
+  }
+
+  const returnTarget = pdfReturnFocus;
+  pdfReturnFocus = null;
+  if (returnTarget && typeof returnTarget.focus === 'function' && document.contains(returnTarget)) {
+    try {
+      returnTarget.focus({ preventScroll: true });
+    } catch (err) {
+      returnTarget.focus();
+    }
+    return;
+  }
+
+  // No trigger to return to (the preview was opened programmatically): drop
+  // focus from the now-hidden dialog so keyboard/screen-reader focus is not
+  // stranded on an invisible Close button.
+  const activeElement = document.activeElement;
+  if (activeElement && activeElement !== document.body && activeElement !== document.documentElement &&
+      typeof activeElement.blur === 'function' && activeElement.closest && activeElement.closest('#modal-pdf')) {
+    activeElement.blur();
+  }
+}
+
+function ensurePdfPrintRoot() {
+  if (!pdfReportData) return false;
+
+  const printRoot = $('pdf-print-root');
+  if (!printRoot) {
+    alert('The printable PDF area is missing from the page.');
+    return false;
+  }
+  if (pdfContainerHasReport(printRoot)) return true;
+
+  const api = getPdfReportApi();
+  if (!api) {
+    alert('PDF export is unavailable because the PDF report module (js/pdf-report.js) did not load correctly. Reload the app and try again.');
+    return false;
+  }
+
+  try {
+    renderPdfReportInto(printRoot, pdfReportData, api);
+    return true;
+  } catch (err) {
+    printRoot.innerHTML = '';
+    console.error('PDF print-root render failed:', err);
+    alert('Could not rebuild the PDF statement for printing: ' + pdfErrorMessage(err));
+    return false;
+  }
+}
+
+function printPdfReport() {
+  if (!pdfReportData) return;
+  if (!ensurePdfPrintRoot()) return;
+  document.body.classList.add('pdf-printing');
+  window.print();
+}
+
+function handlePdfBeforePrint() {
+  if (pdfReportData) {
+    document.body.classList.add('pdf-printing');
+    ensurePdfPrintRoot();
+  } else {
+    document.body.classList.remove('pdf-printing');
+  }
+}
+
+function trapPdfModalFocus(event) {
+  if (event.key !== 'Tab') return;
+
+  const modal = $('modal-pdf');
+  if (!modal || modal.classList.contains('hide')) return;
+
+  const focusable = modal.querySelectorAll('button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])');
+  if (!focusable.length) return;
+
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+
+  if (!modal.contains(document.activeElement)) {
+    event.preventDefault();
+    first.focus();
+    return;
+  }
+  if (event.shiftKey && document.activeElement === first) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && document.activeElement === last) {
+    event.preventDefault();
+    first.focus();
+  }
+}
+
+function bindPdfPreviewEvents() {
+  const modal = $('modal-pdf');
+  if (modal) {
+    modal.addEventListener('click', function (event) {
+      if (event.target === modal) closePdfPreview();
+    });
+    modal.addEventListener('keydown', trapPdfModalFocus);
+  }
+
+  document.addEventListener('keydown', function (event) {
+    if (event.key !== 'Escape' && event.key !== 'Esc') return;
+    const openModal = $('modal-pdf');
+    if (openModal && !openModal.classList.contains('hide')) {
+      event.preventDefault();
+      closePdfPreview();
+    }
+  });
+
+  window.addEventListener('beforeprint', handlePdfBeforePrint);
+  window.addEventListener('afterprint', function () {
+    const openModal = $('modal-pdf');
+    if (!openModal || openModal.classList.contains('hide')) {
+      document.body.classList.remove('pdf-printing');
+    }
+  });
+}
+
 async function clearAllData() {
-  if (!confirm('Erase every bill, item and attachment? This cannot be undone.')) return;
+  if (!(await appConfirm('Erase every bill, item and attachment? This cannot be undone.', {
+    title: 'Erase all data?',
+    confirmLabel: 'Erase everything',
+    danger: true
+  }))) return;
   await dbClearEverything();
   projects = [];
   items = [];
@@ -2196,7 +2482,7 @@ async function clearAllData() {
   state.participants = [state.userName];
   await saveMeta();
   updateAllViews();
-  alert('All data erased.');
+  appToast('All data erased.', 'success');
 }
 
 async function importData(event) {
@@ -2227,7 +2513,11 @@ async function importData(event) {
     return alert('That backup was made by an older version and is not supported. Send it over and it can be ported.');
   }
 
-  if (!confirm('Replace everything with this backup? Current bills will be erased.')) return;
+  if (!(await appConfirm('Replace everything with this backup? Current bills will be erased.', {
+    title: 'Replace current data?',
+    confirmLabel: 'Replace',
+    danger: true
+  }))) return;
 
   try {
     await dbClearEverything();
@@ -2252,7 +2542,7 @@ async function importData(event) {
     expandedProjectIds = new Set();
     switchView('history');
     updateAllViews();
-    alert('Restored ' + projects.length + ' bill(s) and ' + items.length + ' item(s).');
+    appToast('Restored ' + projects.length + ' bill(s) and ' + items.length + ' item(s).', 'success');
   } catch (err) {
     alert('Restore failed: ' + err.message);
   }
@@ -2897,7 +3187,7 @@ async function executeImport() {
     closeImportModal();
     switchView('history');
     updateAllViews();
-    alert('Imported ' + imported + ' item(s) across ' + newProjectIds.length + ' bill(s).');
+    appToast('Imported ' + imported + ' item(s) across ' + newProjectIds.length + ' bill(s).', 'success');
   } catch (err) {
     alert('Import failed: ' + err.message);
   }
@@ -2934,6 +3224,10 @@ if (typeof module !== 'undefined' && module.exports) {
     distributeAmount: distributeAmount,
     toDateOnly: toDateOnly
   };
+}
+
+if (typeof document !== 'undefined') {
+  bindPdfPreviewEvents();
 }
 
 if (typeof window !== 'undefined') {
