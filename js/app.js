@@ -1,1525 +1,2195 @@
-// --- Database Helpers (IndexedDB for Large Files) ---
-    const DB_NAME = 'ExpenseTrackerDB';
-    const DB_VERSION = 1;
+'use strict';
 
-    function getDB() {
-        return new Promise((resolve, reject) => {
-            const request = indexedDB.open(DB_NAME, DB_VERSION);
-            request.onupgradeneeded = e => {
-                const db = e.target.result;
-                if (!db.objectStoreNames.contains('metadata')) db.createObjectStore('metadata');
-                if (!db.objectStoreNames.contains('expenses')) db.createObjectStore('expenses', { keyPath: 'id' });
-            };
-            request.onsuccess = e => resolve(e.target.result);
-            request.onerror = e => reject(e.target.error);
-        });
+/* ------------------------------------------------------------------
+   SplitTrack - bills with independently split items.
+
+   metadata : { userName, currency, participants }
+   projects : { id, name, date, payer, categories, attachments, createdAt }
+   items    : { id, projectId, order, date, description, category,
+                amount, paidBy, splitMethod, splits, settled }
+   ------------------------------------------------------------------ */
+
+const DB_NAME = 'SplitTrackDB';
+const DB_VERSION = 1;
+const STORE_META = 'metadata';
+const STORE_PROJECTS = 'projects';
+const STORE_ITEMS = 'items';
+
+const AI_BILL_PROMPT = [
+  'Extract every line item from the bill/receipt shown and return a plain CSV.',
+  'Use exactly these columns: Date, Bill, Item, Category, Amount, Split With',
+  '',
+  'Rules:',
+  '1. Date - bill date as YYYY-MM-DD (use today if the bill has no date).',
+  '2. Bill - one short name for the whole bill, repeated on every row (e.g. "Spice Route dinner", "Trek 2026").',
+  '3. Item - the clean item name, one row per billed line (e.g. "Paneer Tikka", "Parking").',
+  '4. Category - a short label you choose for that item, 1-2 words (e.g. "Starters", "Drinks", "Travel"). No fixed list: name categories freshly and keep them consistent within the bill.',
+  '5. Amount - numbers only: no currency symbols and no thousands separators (write 1234.50, not 1,234.50). Put tax, service charge, tip and delivery fee on their own rows so the bill total stays exact. Put discounts as negative rows. Never include subtotal or grand total rows.',
+  '6. Split With - fill only if the bill itself says who had an item (e.g. "for Ali"); separate names with semicolons. Otherwise leave it empty - the app lets you tick people per item.',
+  '7. Output only the CSV inside a code fence, no commentary.'
+].join('\n');
+
+const ICON = {
+  trash: 'M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16',
+  pencil: 'M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z',
+  check: 'M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z',
+  plus: 'M12 4v16m8-8H4',
+  download: 'M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4',
+  close: 'M6 18L18 6M6 6l12 12'
+};
+
+const state = {
+  userName: 'You',
+  currency: '₹',
+  participants: ['You']
+};
+
+let projects = [];
+let items = [];
+let dbPromise = null;
+
+let expandedProjectIds = new Set();
+let editingItem = null;
+let itemModalPeople = new Set();
+let editingBillId = null;
+let billModalAttachments = [];
+let stagedBillAttachments = [];
+let draftRowSeq = 0;
+let importBills = [];
+let importDefaultParticipants = [];
+let chartInstances = { date: null, people: null, category: null };
+let idSeq = 0;
+
+/* ------------------------- small helpers ------------------------- */
+
+function $(id) { return document.getElementById(id); }
+
+function uid() {
+  idSeq = (idSeq + 1) % 1000;
+  return (Date.now() * 1000) + idSeq;
+}
+
+function esc(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function money(value) {
+  const n = Number(value) || 0;
+  return state.currency + n.toFixed(2);
+}
+
+function pad2(n) { return n < 10 ? '0' + n : String(n); }
+
+function todayStr() {
+  const d = new Date();
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+function toDateOnly(value) {
+  if (value === undefined || value === null || value === '') return todayStr();
+  const raw = String(value).trim();
+  const m = raw.match(/^(\d{4})-(\d{2})-(\d{2})/);
+  if (m) return m[1] + '-' + m[2] + '-' + m[3];
+  const d = new Date(raw);
+  if (isNaN(d.getTime())) return todayStr();
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+
+function isoFromDateOnly(dateOnly) {
+  const parts = toDateOnly(dateOnly).split('-');
+  const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 12, 0, 0);
+  return d.toISOString();
+}
+
+function dateLabel(iso) {
+  const parts = toDateOnly(iso).split('-');
+  const d = new Date(Number(parts[0]), Number(parts[1]) - 1, Number(parts[2]), 12, 0, 0);
+  return d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
+}
+
+function samePerson(a, b) {
+  return String(a).toLowerCase() === String(b).toLowerCase();
+}
+
+function canonicalParticipant(name) {
+  const wanted = String(name === undefined || name === null ? '' : name).trim();
+  if (!wanted) return '';
+  const found = state.participants.find(function (p) { return samePerson(p, wanted); });
+  return found || wanted;
+}
+
+function equalSplits(amount, names) {
+  const out = {};
+  const unique = [];
+  (names || []).forEach(function (n) {
+    if (!n) return;
+    if (!unique.some(function (u) { return samePerson(u, n); })) unique.push(n);
+  });
+  if (!unique.length) return out;
+  const share = Number(amount) / unique.length;
+  unique.forEach(function (n) { out[n] = share; });
+  return out;
+}
+
+function svgIcon(path, cls) {
+  return '<svg class="' + (cls || 'w-4 h-4') + '" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
+    '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="' + path + '"></path></svg>';
+}
+
+function downloadDataUrl(dataUrl, name) {
+  const link = document.createElement('a');
+  link.href = dataUrl;
+  link.download = name || 'download';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+
+function downloadText(text, fileName, mime) {
+  const url = URL.createObjectURL(new Blob([text], { type: mime || 'text/csv;charset=utf-8;' }));
+  downloadDataUrl(url, fileName);
+  setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+}
+
+/* --------------------------- CSV parsing -------------------------- */
+
+function parseCSVLine(text) {
+  let cells = [''];
+  let i = 0;
+  let prev = '';
+  let inQuotes = true;
+  for (const ch of text) {
+    if (ch === '"') {
+      if (inQuotes && ch === prev) cells[i] += ch;
+      inQuotes = !inQuotes;
+    } else if (ch === ',' && inQuotes) {
+      i += 1;
+      cells[i] = '';
+    } else {
+      cells[i] += ch;
+    }
+    prev = ch;
+  }
+  return cells.map(function (c) {
+    return c.trim().replace(/^"|"$/g, '').replace(/""/g, '"');
+  });
+}
+
+function stripCodeFences(text) {
+  const tick = String.fromCharCode(96);
+  const fence = tick + tick + tick;
+  let out = String(text).split(fence).join('');
+  out = out.replace(/^(?:csv|text|plaintext|tsv)\s*\r?\n/i, '');
+  return out.trim();
+}
+
+function parseAmount(raw) {
+  if (raw === undefined || raw === null) return 0;
+  let s = String(raw).trim();
+  if (!s) return 0;
+  let negative = false;
+  if (/^\(.*\)$/.test(s)) { negative = true; s = s.slice(1, -1); }
+  s = s.replace(/[^0-9.\-]/g, '');
+  if (!s || s === '-' || s === '.') return 0;
+  let n = parseFloat(s);
+  if (isNaN(n)) return 0;
+  if (negative && n > 0) n = -n;
+  return n;
+}
+
+function splitNameList(raw) {
+  if (!raw) return [];
+  return String(raw).split(/[;|,]/).map(function (n) { return n.trim(); }).filter(Boolean);
+}
+
+const HEADER_HINTS = ['date', 'bill', 'project', 'item', 'description', 'title',
+  'category', 'amount', 'cost', 'price', 'split', 'participant', 'merchant', 'event', 'total'];
+
+function looksLikeHeader(cells) {
+  return cells.some(function (c) {
+    return HEADER_HINTS.indexOf(String(c).trim().toLowerCase()) !== -1;
+  });
+}
+
+function parseBillCSV(text) {
+  const result = { bills: [], rows: 0 };
+  if (!text || !String(text).trim()) return result;
+
+  const lines = stripCodeFences(text).split(/\r?\n/)
+    .map(function (l) { return l.trim(); })
+    .filter(function (l) { return l.length > 0; });
+  if (!lines.length) return result;
+
+  const header = parseCSVLine(lines[0]);
+  const hasHeader = looksLikeHeader(header);
+  const used = {};
+  let dateCol = -1;
+  let billCol = -1;
+  let itemCol = -1;
+  let catCol = -1;
+  let amtCol = -1;
+  let splitCol = -1;
+  let start = 0;
+
+  function pick(keys) {
+    for (let i = 0; i < header.length; i += 1) {
+      if (used[i]) continue;
+      const h = String(header[i]).toLowerCase();
+      if (keys.some(function (k) { return h.indexOf(k) !== -1; })) {
+        used[i] = true;
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  if (hasHeader) {
+    start = 1;
+    dateCol = pick(['date', 'when']);
+    billCol = pick(['bill', 'project', 'merchant', 'event', 'shop', 'store']);
+    itemCol = pick(['item', 'desc', 'title', 'name', 'particular']);
+    catCol = pick(['categor', 'cat', 'type', 'group']);
+    amtCol = pick(['amount', 'cost', 'price', 'total', 'value']);
+    splitCol = pick(['split', 'shared', 'participant', 'who', 'people']);
+  } else {
+    const probe = parseCSVLine(lines[0]);
+    if (probe.length >= 4) {
+      dateCol = 0; itemCol = 1; catCol = 2; amtCol = 3;
+    } else if (probe.length === 3) {
+      if (/^\d{4}-\d{2}-\d{2}$/.test(probe[0])) { dateCol = 0; itemCol = 1; amtCol = 2; }
+      else { itemCol = 0; catCol = 1; amtCol = 2; }
+    } else if (probe.length === 2) {
+      itemCol = 0; amtCol = 1;
+    }
+  }
+
+  if (itemCol === -1 || amtCol === -1) return result;
+
+  const billMap = new Map();
+  for (let i = start; i < lines.length; i += 1) {
+    const cols = parseCSVLine(lines[i]);
+    if (cols.length < 2) continue;
+
+    const dateVal = (dateCol !== -1 && cols[dateCol]) ? toDateOnly(cols[dateCol]) : todayStr();
+    const billName = (billCol !== -1 && cols[billCol]) ? cols[billCol].trim() : '';
+    let desc = (cols[itemCol] || '').trim();
+    let category = (catCol !== -1 && cols[catCol]) ? cols[catCol].trim() : '';
+    const amount = (amtCol !== -1) ? parseAmount(cols[amtCol]) : 0;
+    const splitWith = (splitCol !== -1 && cols[splitCol]) ? splitNameList(cols[splitCol]) : [];
+
+    if (!desc) desc = 'Item';
+    if (!category) category = 'Uncategorised';
+    if (!amount) continue;
+
+    const key = billName.toLowerCase() + '|' + dateVal;
+    let bill = billMap.get(key);
+    if (!bill) {
+      bill = { name: billName, date: dateVal, items: [] };
+      billMap.set(key, bill);
+    }
+    bill.items.push({ description: desc, category: category, amount: amount, splitWith: splitWith });
+    result.rows += 1;
+  }
+
+  result.bills = Array.from(billMap.values());
+  return result;
+}
+
+/* ---------------------------- database ---------------------------- */
+
+function getDB() {
+  if (!dbPromise) {
+    dbPromise = new Promise(function (resolve, reject) {
+      const req = indexedDB.open(DB_NAME, DB_VERSION);
+      req.onupgradeneeded = function (event) {
+        const db = event.target.result;
+        if (!db.objectStoreNames.contains(STORE_META)) db.createObjectStore(STORE_META);
+        if (!db.objectStoreNames.contains(STORE_PROJECTS)) db.createObjectStore(STORE_PROJECTS, { keyPath: 'id' });
+        if (!db.objectStoreNames.contains(STORE_ITEMS)) db.createObjectStore(STORE_ITEMS, { keyPath: 'id' });
+      };
+      req.onsuccess = function () { resolve(req.result); };
+      req.onerror = function () { reject(req.error); };
+    });
+  }
+  return dbPromise;
+}
+
+async function dbGetAll(store) {
+  const db = await getDB();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).getAll();
+    req.onsuccess = function () { resolve(req.result || []); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+
+async function dbGet(store, key) {
+  const db = await getDB();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction(store, 'readonly');
+    const req = tx.objectStore(store).get(key);
+    req.onsuccess = function () { resolve(req.result); };
+    req.onerror = function () { reject(req.error); };
+  });
+}
+
+async function dbPut(store, value, key) {
+  const db = await getDB();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction(store, 'readwrite');
+    const os = tx.objectStore(store);
+    if (key === undefined) os.put(value); else os.put(value, key);
+    tx.oncomplete = function () { resolve(); };
+    tx.onerror = function () { reject(tx.error); };
+  });
+}
+
+async function dbDelete(store, key) {
+  const db = await getDB();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction(store, 'readwrite');
+    tx.objectStore(store).delete(key);
+    tx.oncomplete = function () { resolve(); };
+    tx.onerror = function () { reject(tx.error); };
+  });
+}
+
+async function dbClearEverything() {
+  const db = await getDB();
+  return new Promise(function (resolve, reject) {
+    const tx = db.transaction([STORE_META, STORE_PROJECTS, STORE_ITEMS], 'readwrite');
+    tx.objectStore(STORE_META).clear();
+    tx.objectStore(STORE_PROJECTS).clear();
+    tx.objectStore(STORE_ITEMS).clear();
+    tx.oncomplete = function () { resolve(); };
+    tx.onerror = function () { reject(tx.error); };
+  });
+}
+
+async function saveMeta() {
+  await dbPut(STORE_META, {
+    userName: state.userName,
+    currency: state.currency,
+    participants: state.participants.slice()
+  }, 'appState');
+}
+
+/* ----------------------------- lookup ----------------------------- */
+
+function projectById(id) {
+  return projects.find(function (p) { return p.id === id; }) || null;
+}
+
+function itemsOfProject(id) {
+  return items.filter(function (it) { return it.projectId === id; });
+}
+
+/* ------------------------- startup / views ------------------------ */
+
+let eventsBound = false;
+
+function bindEvents() {
+  if (eventsBound) return;
+  eventsBound = true;
+
+  const billForm = $('expense-form');
+  if (billForm) billForm.addEventListener('submit', saveBill);
+  const itemForm = $('item-form');
+  if (itemForm) itemForm.addEventListener('submit', saveItemModal);
+  const billModalForm = $('bill-form');
+  if (billModalForm) billModalForm.addEventListener('submit', saveBillModal);
+  const peopleForm = $('add-person-form');
+  if (peopleForm) peopleForm.addEventListener('submit', addPerson);
+}
+
+async function init() {
+  try {
+    const meta = await dbGet(STORE_META, 'appState');
+    if (meta) {
+      if (meta.userName) state.userName = meta.userName;
+      if (meta.currency) state.currency = meta.currency;
+      if (Array.isArray(meta.participants) && meta.participants.length) {
+        state.participants = meta.participants.slice();
+      }
+    }
+    if (!state.participants.some(function (p) { return samePerson(p, state.userName); })) {
+      state.participants.unshift(state.userName);
     }
 
-    async function dbSaveMeta(metaData) {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('metadata', 'readwrite');
-            tx.objectStore('metadata').put(metaData, 'appState');
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
-        });
+    projects = await dbGetAll(STORE_PROJECTS);
+    items = await dbGetAll(STORE_ITEMS);
+    const projectIds = new Set(projects.map(function (p) { return p.id; }));
+    items = items.filter(function (it) { return projectIds.has(it.projectId); });
+
+    bindEvents();
+    updateCurrencyDisplay();
+    switchView('dashboard');
+    updateAllViews();
+  } catch (err) {
+    console.error(err);
+    alert('Could not open local storage: ' + err.message);
+  }
+}
+
+function switchView(viewName) {
+  document.querySelectorAll('.view-section').forEach(function (el) { el.classList.add('hide'); });
+  const target = $('view-' + viewName);
+  if (target) target.classList.remove('hide');
+
+  document.querySelectorAll('.bottom-nav button').forEach(function (el) {
+    el.classList.remove('text-indigo-600');
+    el.classList.add('text-gray-500');
+  });
+  if (viewName !== 'settings') {
+    const nav = $('nav-' + viewName);
+    if (nav) {
+      nav.classList.remove('text-gray-500');
+      nav.classList.add('text-indigo-600');
+    }
+  }
+
+  if (viewName === 'dashboard') renderDashboard();
+  if (viewName === 'history') renderHistory();
+  if (viewName === 'people') renderPeople();
+  if (viewName === 'settings') {
+    const nameInput = $('setting-user-name');
+    if (nameInput) nameInput.value = state.userName;
+    const currencyInput = $('setting-currency');
+    if (currencyInput) currencyInput.value = state.currency;
+  }
+}
+
+function updateAllViews() {
+  updateFilters();
+  renderDashboard();
+  renderHistory();
+  renderPeople();
+  updateCurrencyDisplay();
+}
+
+function updateCurrencyDisplay() {
+  document.querySelectorAll('.currency-display').forEach(function (el) {
+    el.textContent = state.currency;
+  });
+}
+
+/* ---------------------------- filters ----------------------------- */
+
+function filterState(prefix) {
+  function read(id) {
+    const el = $(id);
+    return el ? el.value : '';
+  }
+  const f = {
+    search: (read(prefix + '-filter-search') || '').toLowerCase().trim(),
+    category: read(prefix + '-filter-category') || 'all',
+    person: read(prefix + '-filter-person') || 'all',
+    payer: read(prefix + '-filter-payer') || 'all',
+    month: read(prefix + '-filter-month') || '',
+    date: read(prefix + '-filter-date') || '',
+    persons: null
+  };
+  if (prefix === 'hist') {
+    const boxes = Array.prototype.slice.call(document.querySelectorAll('.hist-filter-chk'));
+    const checked = boxes.filter(function (b) { return b.checked; });
+    if (boxes.length && checked.length < boxes.length) {
+      f.persons = checked.map(function (b) { return b.dataset.name; });
+    }
+  }
+  return f;
+}
+
+function filterItems(prefix) {
+  const f = filterState(prefix);
+  return items.filter(function (it) {
+    const project = projectById(it.projectId);
+    const desc = String(it.description || '').toLowerCase();
+    const billName = project ? String(project.name || '').toLowerCase() : '';
+
+    if (f.search && desc.indexOf(f.search) === -1 && billName.indexOf(f.search) === -1) return false;
+    if (f.category !== 'all' && it.category !== f.category) return false;
+    if (f.person !== 'all') {
+      const inSplit = it.splits && Object.prototype.hasOwnProperty.call(it.splits, f.person) && it.splits[f.person] !== 0;
+      if (it.paidBy !== f.person && !inSplit) return false;
+    }
+    if (f.payer !== 'all' && it.paidBy !== f.payer) return false;
+
+    const day = toDateOnly(it.date);
+    if (f.month && day.slice(0, 7) !== f.month) return false;
+    if (f.date && day !== f.date) return false;
+
+    if (f.persons && f.persons.length) {
+      const involved = f.persons.some(function (p) {
+        return it.paidBy === p || (it.splits && it.splits[p] !== undefined && it.splits[p] !== 0);
+      });
+      if (!involved) return false;
+    }
+    return true;
+  });
+}
+
+function updateFilters() {
+  const categories = Array.from(new Set(items.map(function (it) { return it.category; }).filter(Boolean))).sort();
+
+  ['dash', 'hist'].forEach(function (prefix) {
+    const catSel = $(prefix + '-filter-category');
+    if (catSel) {
+      const current = catSel.value;
+      catSel.innerHTML = '<option value="all">Category: All</option>' + categories.map(function (c) {
+        return '<option value="' + esc(c) + '">' + esc(c) + '</option>';
+      }).join('');
+      if (current && (current === 'all' || categories.indexOf(current) !== -1)) catSel.value = current;
     }
 
-    async function dbGetMeta() {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('metadata', 'readonly');
-            const req = tx.objectStore('metadata').get('appState');
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
-        });
+    const personSel = $(prefix + '-filter-person');
+    if (personSel) {
+      const current = personSel.value;
+      personSel.innerHTML = '<option value="all">Involved: All</option>' + state.participants.map(function (p) {
+        return '<option value="' + esc(p) + '">' + esc(p) + '</option>';
+      }).join('');
+      if (current && (current === 'all' || state.participants.indexOf(current) !== -1)) personSel.value = current;
     }
 
-    async function dbSaveExpense(expense) {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('expenses', 'readwrite');
-            tx.objectStore('expenses').put(expense);
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
-        });
+    const payerSel = $(prefix + '-filter-payer');
+    if (payerSel) {
+      const current = payerSel.value;
+      payerSel.innerHTML = '<option value="all">Paid By: All</option>' + state.participants.map(function (p) {
+        return '<option value="' + esc(p) + '">' + esc(p) + '</option>';
+      }).join('');
+      if (current && (current === 'all' || state.participants.indexOf(current) !== -1)) payerSel.value = current;
     }
+  });
 
-    async function dbGetAllExpenses() {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('expenses', 'readonly');
-            const req = tx.objectStore('expenses').getAll();
-            req.onsuccess = () => resolve(req.result);
-            req.onerror = () => reject(req.error);
-        });
-    }
+  const box = $('hist-filter-participant-checkboxes');
+  if (box) {
+    const saved = {};
+    Array.prototype.forEach.call(box.querySelectorAll('.hist-filter-chk'), function (chk) {
+      saved[chk.dataset.name] = chk.checked;
+    });
+    box.innerHTML = state.participants.map(function (p) {
+      const checked = saved[p] !== undefined ? saved[p] : true;
+      return '<label class="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-50/50 border border-indigo-200 rounded-md text-xs font-medium text-indigo-900 cursor-pointer hover:bg-indigo-100 transition-colors select-none">' +
+        '<input type="checkbox" data-name="' + esc(p) + '" ' + (checked ? 'checked' : '') +
+        ' onchange="renderHistory()" class="hist-filter-chk w-3.5 h-3.5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">' +
+        '<span>' + esc(p) + (p === state.userName ? ' (You)' : '') + '</span></label>';
+    }).join('');
+  }
+}
 
-    async function dbDeleteExpense(id) {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction('expenses', 'readwrite');
-            tx.objectStore('expenses').delete(id);
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
-        });
-    }
+function clearFilters(prefix) {
+  const search = $(prefix + '-filter-search');
+  if (search) search.value = '';
+  ['person', 'payer', 'category'].forEach(function (key) {
+    const el = $(prefix + '-filter-' + key);
+    if (el) el.value = 'all';
+  });
+  ['month', 'date'].forEach(function (key) {
+    const el = $(prefix + '-filter-' + key);
+    if (el) el.value = '';
+  });
+  if (prefix === 'hist') {
+    Array.prototype.forEach.call(document.querySelectorAll('.hist-filter-chk'), function (c) { c.checked = true; });
+    renderHistory();
+  } else {
+    renderDashboard();
+  }
+}
 
-    async function dbClearAll() {
-        const db = await getDB();
-        return new Promise((resolve, reject) => {
-            const tx = db.transaction(['metadata', 'expenses'], 'readwrite');
-            tx.objectStore('metadata').clear();
-            tx.objectStore('expenses').clear();
-            tx.oncomplete = () => resolve();
-            tx.onerror = () => reject(tx.error);
-        });
-    }
+function selectAllHistFilterParticipants(selectAll) {
+  Array.prototype.forEach.call(document.querySelectorAll('.hist-filter-chk'), function (c) { c.checked = selectAll; });
+  renderHistory();
+}
 
-    // --- Application State ---
-    let state = {
-        userName: 'You',
-        currency: '₹',
-        participants: ['You'],
-        categories: ['Food', 'Travel', 'Stay', 'Entertainment', 'Other'],
-        currentSplitMethod: 'equal'
+/* -------------------------- attachments --------------------------- */
+
+function stageFiles(files, target, after) {
+  const list = Array.from(files || []);
+  if (!list.length) return;
+  let pending = list.length;
+  list.forEach(function (file) {
+    const reader = new FileReader();
+    reader.onload = function (e) {
+      target.push({ name: file.name, type: file.type || 'application/octet-stream', data: e.target.result });
+      pending -= 1;
+      if (pending === 0) after();
     };
-    let expenses = []; 
-    
-    let dateChartInstance = null;
-    let categoryChartInstance = null;
-    let peopleChartInstance = null;
-    let editingExpenseId = null;
-    let stagedAttachments = []; 
+    reader.readAsDataURL(file);
+  });
+}
 
-    // --- Initialization & Migration ---
-    async function init() {
-        try {
-            const oldData = localStorage.getItem('expenseTrackerData');
-            if (oldData) {
-                const parsed = JSON.parse(oldData);
-                state.userName = parsed.userName || 'You';
-                state.currency = parsed.currency || '₹';
-                state.participants = parsed.participants || ['You'];
-                state.categories = parsed.categories || ['Food', 'Travel', 'Stay', 'Other'];
-                
-                await dbSaveMeta(state);
-                if (parsed.expenses) {
-                    for (let exp of parsed.expenses) {
-                        delete exp.subcategory; // cleanup old field
-                        await dbSaveExpense(exp);
-                    }
-                }
-                localStorage.removeItem('expenseTrackerData');
-            } else {
-                const meta = await dbGetMeta();
-                if (meta) state = { ...state, ...meta };
-            }
+function attachmentCards(atts, removeFn) {
+  return atts.map(function (att, idx) {
+    const isImage = String(att.type || '').indexOf('image/') === 0;
+    const preview = isImage
+      ? '<img src="' + att.data + '" class="h-8 w-8 object-cover rounded">'
+      : '<span class="h-8 w-8 rounded bg-red-50 text-red-500 text-[10px] font-bold flex items-center justify-center">PDF</span>';
+    return '<div class="flex items-center justify-between bg-white border border-gray-200 rounded-lg p-2">' +
+      '<div class="flex items-center gap-2 min-w-0">' + preview +
+        '<span class="text-xs text-gray-600 truncate">' + esc(att.name) + '</span>' +
+      '</div>' +
+      '<button type="button" onclick="' + removeFn + '(' + idx + ')" class="text-red-400 hover:text-red-600 p-1" title="Remove">' +
+        svgIcon(ICON.trash, 'w-4 h-4') + '</button>' +
+    '</div>';
+  }).join('');
+}
 
-            expenses = await dbGetAllExpenses() || [];
-            
-            // Clean up subcategories from existing expenses
-            expenses.forEach(e => { delete e.subcategory; });
-            
-            if (!state.participants.includes(state.userName)) {
-                state.participants.unshift(state.userName);
-            }
+function handleDraftFiles(event) {
+  const input = event.target;
+  stageFiles(input.files, stagedBillAttachments, function () {
+    renderDraftAttachments();
+    input.value = '';
+  });
+}
 
-            updateCurrencyDisplay();
-            switchView('dashboard');
-            updateAllViews();
-        } catch(e) {
-            console.error("Initialization Error:", e);
-        }
-    }
+function renderDraftAttachments() {
+  const box = $('draft-attachment-previews');
+  if (box) box.innerHTML = attachmentCards(stagedBillAttachments, 'removeDraftAttachment');
+}
 
-    async function saveMetadataOnly() {
-        await dbSaveMeta(state);
-    }
+function removeDraftAttachment(index) {
+  stagedBillAttachments.splice(index, 1);
+  renderDraftAttachments();
+}
 
-    function formatMoney(amount) {
-        return `${state.currency}${amount.toFixed(2)}`;
-    }
+function handleBillModalFiles(event) {
+  const input = event.target;
+  stageFiles(input.files, billModalAttachments, function () {
+    renderBillModalAttachments();
+    input.value = '';
+  });
+}
 
-    function updateCurrencyDisplay() {
-        document.querySelectorAll('.currency-display').forEach(el => el.innerText = state.currency);
-    }
+function renderBillModalAttachments() {
+  const box = $('bill-modal-attachments');
+  if (box) box.innerHTML = attachmentCards(billModalAttachments, 'removeBillModalAttachment');
+}
 
-    function updateFilters() {
-        const catOptions = '<option value="all">Category: All</option>' + 
-            state.categories.map(c => `<option value="${c}">${c}</option>`).join('');
-            
-        const personOptions = '<option value="all">Involved: All</option>' + 
-            state.participants.map(p => `<option value="${p}">${p}</option>`).join('');
-            
-        const payerOptions = '<option value="all">Paid By: All</option>' + 
-            state.participants.map(p => `<option value="${p}">${p}</option>`).join('');
-            
-        // Update both Dashboard and History filters
-        ['dash', 'hist'].forEach(prefix => {
-            const catSelect = document.getElementById(`${prefix}-filter-category`);
-            const personSelect = document.getElementById(`${prefix}-filter-person`);
-            const payerSelect = document.getElementById(`${prefix}-filter-payer`);
-            
-            const currCat = catSelect.value;
-            const currPerson = personSelect.value;
-            const currPayer = payerSelect.value;
-            
-            catSelect.innerHTML = catOptions;
-            personSelect.innerHTML = personOptions;
-            payerSelect.innerHTML = payerOptions;
-            
-            if (state.categories.includes(currCat) || currCat === 'all') catSelect.value = currCat;
-            if (state.participants.includes(currPerson) || currPerson === 'all') personSelect.value = currPerson;
-            if (state.participants.includes(currPayer) || currPayer === 'all') payerSelect.value = currPayer;
-        });
+function removeBillModalAttachment(index) {
+  billModalAttachments.splice(index, 1);
+  renderBillModalAttachments();
+}
 
-        // Populate Timeline multi-select participant checkboxes
-        const histContainer = document.getElementById('hist-filter-participant-checkboxes');
-        if (histContainer) {
-            const savedChecked = {};
-            histContainer.querySelectorAll('.hist-filter-chk').forEach(chk => {
-                savedChecked[chk.getAttribute('data-name')] = chk.checked;
-            });
-            
-            histContainer.innerHTML = state.participants.map(p => {
-                const isChecked = savedChecked[p] !== undefined ? savedChecked[p] : true;
-                return `
-                    <label class="inline-flex items-center gap-1.5 px-2 py-1 bg-indigo-50/50 border border-indigo-200 rounded-md text-xs font-medium text-indigo-900 cursor-pointer hover:bg-indigo-100 transition-colors select-none">
-                        <input type="checkbox" data-name="${p}" ${isChecked ? 'checked' : ''} onchange="renderHistory()" class="hist-filter-chk w-3.5 h-3.5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500">
-                        <span>${p}${p === state.userName ? ' (You)' : ''}</span>
-                    </label>
-                `;
-            }).join('');
-        }
-    }
+function viewProjectAttachment(projectId, index) {
+  const project = projectById(projectId);
+  if (!project || !project.attachments || !project.attachments[index]) return;
+  const att = project.attachments[index];
+  if (String(att.type || '').indexOf('image/') === 0) openImageViewer(att.data, att.name);
+  else downloadDataUrl(att.data, att.name);
+}
 
-    function selectAllHistFilterParticipants(selectAll) {
-        document.querySelectorAll('.hist-filter-chk').forEach(chk => chk.checked = selectAll);
-        renderHistory();
-    }
+function downloadProjectAttachment(projectId, index) {
+  const project = projectById(projectId);
+  if (!project || !project.attachments || !project.attachments[index]) return;
+  downloadDataUrl(project.attachments[index].data, project.attachments[index].name);
+}
 
-    function clearFilters(viewPrefix) {
-        document.getElementById(`${viewPrefix}-filter-search`).value = '';
-        document.getElementById(`${viewPrefix}-filter-person`).value = 'all';
-        document.getElementById(`${viewPrefix}-filter-payer`).value = 'all';
-        document.getElementById(`${viewPrefix}-filter-category`).value = 'all';
-        document.getElementById(`${viewPrefix}-filter-month`).value = '';
-        document.getElementById(`${viewPrefix}-filter-date`).value = '';
-        
-        if (viewPrefix === 'hist') {
-            document.querySelectorAll('.hist-filter-chk').forEach(chk => chk.checked = true);
-        }
+function projectAttachmentHtml(project) {
+  const atts = project.attachments || [];
+  if (!atts.length) return '';
+  return '<div class="mt-2 pt-2 border-t border-gray-200">' +
+    '<p class="text-[10px] font-bold uppercase tracking-wider text-gray-400 mb-1">Receipts</p>' +
+    '<div class="flex flex-col gap-1.5">' + atts.map(function (att, idx) {
+      const isImage = String(att.type || '').indexOf('image/') === 0;
+      return '<div class="flex items-center justify-between bg-white border border-gray-200 rounded-lg p-1.5">' +
+        '<button type="button" onclick="viewProjectAttachment(' + project.id + ', ' + idx + ')" class="flex items-center gap-2 min-w-0 text-left">' +
+          (isImage ? '<img src="' + att.data + '" class="h-7 w-7 object-cover rounded">' :
+            '<span class="h-7 w-7 rounded bg-red-50 text-red-500 text-[9px] font-bold flex items-center justify-center">PDF</span>') +
+          '<span class="text-[11px] text-gray-600 truncate">' + esc(att.name) + '</span>' +
+        '</button>' +
+        '<button type="button" onclick="downloadProjectAttachment(' + project.id + ', ' + idx + ')" class="text-gray-400 hover:text-indigo-600 p-1" title="Save">' +
+          svgIcon(ICON.download, 'w-4 h-4') + '</button>' +
+      '</div>';
+    }).join('') + '</div></div>';
+}
 
-        if (viewPrefix === 'dash') renderDashboard();
-        if (viewPrefix === 'hist') renderHistory();
-    }
+function openImageViewer(src, name) {
+  const img = $('image-viewer-img');
+  const dl = $('image-viewer-download');
+  if (!img || !dl) return;
+  img.src = src;
+  dl.href = src;
+  dl.download = name || 'receipt';
+  $('image-viewer').classList.remove('hide');
+}
 
-    function applyFilters(expenseList, viewPrefix) {
-        const filterSearch = document.getElementById(`${viewPrefix}-filter-search`).value.toLowerCase();
-        const filterCat = document.getElementById(`${viewPrefix}-filter-category`).value;
-        const filterPerson = document.getElementById(`${viewPrefix}-filter-person`).value;
-        const filterPayer = document.getElementById(`${viewPrefix}-filter-payer`).value;
-        const filterMonth = document.getElementById(`${viewPrefix}-filter-month`).value;
-        const filterDate = document.getElementById(`${viewPrefix}-filter-date`).value;
+function closeImageViewer() {
+  const viewer = $('image-viewer');
+  if (!viewer) return;
+  viewer.classList.add('hide');
+  const img = $('image-viewer-img');
+  if (img) img.src = '';
+}
 
-        let checkedFilterPersons = null;
-        if (viewPrefix === 'hist') {
-            const chks = document.querySelectorAll('.hist-filter-chk:checked');
-            const totalChks = document.querySelectorAll('.hist-filter-chk');
-            if (totalChks.length > 0 && chks.length < totalChks.length) {
-                checkedFilterPersons = Array.from(chks).map(c => c.getAttribute('data-name'));
-            }
-        }
 
-        return expenseList.filter(exp => {
-            // Search Match
-            let matchSearch = !filterSearch || exp.description.toLowerCase().includes(filterSearch);
+/* ---------------------- add bill (draft) form -------------------- */
 
-            // Category Match
-            let matchCat = filterCat === 'all' || exp.category === filterCat;
-            
-            // Person filter logic: Shows if they are involved in the split or if they paid
-            let matchPerson = filterPerson === 'all' || 
-                              exp.paidBy === filterPerson || 
-                              (exp.splits && exp.splits[filterPerson] !== undefined);
-                              
-            // Payer filter strictly checks who paid
-            let matchPayer = filterPayer === 'all' || exp.paidBy === filterPayer;
+function payerOptionsHtml(selected) {
+  let html = '<option value="" disabled' + (selected ? '' : ' selected') + '>Select who paid</option>';
+  html += state.participants.map(function (p) {
+    return '<option value="' + esc(p) + '"' + (p === selected ? ' selected' : '') + '>' +
+      esc(p) + (p === state.userName ? ' (You)' : '') + '</option>';
+  }).join('');
+  return html;
+}
 
-            // Date & Month filtering
-            let matchMonth = !filterMonth || exp.date.startsWith(filterMonth);
-            let matchDate = !filterDate || exp.date.startsWith(filterDate);
+function openAddForm() {
+  resetAddForm();
+  const title = $('form-title');
+  if (title) title.textContent = 'New Bill';
+  const submitText = $('submit-text');
+  if (submitText) submitText.textContent = 'Save Bill';
+  switchView('add');
+  const first = document.querySelector('#draft-items .draft-desc');
+  if (first) first.focus();
+}
 
-            // Participant Filter Checkboxes
-            let matchFilterPersons = true;
-            if (checkedFilterPersons) {
-                matchFilterPersons = checkedFilterPersons.some(p => exp.paidBy === p || (exp.splits && exp.splits[p] !== undefined && exp.splits[p] > 0));
-            }
+function resetAddForm() {
+  stagedBillAttachments = [];
+  renderDraftAttachments();
 
-            return matchSearch && matchCat && matchPerson && matchPayer && matchMonth && matchDate && matchFilterPersons;
-        });
-    }
+  const nameInput = $('bill-name');
+  if (nameInput) nameInput.value = '';
+  const dateInput = $('bill-date');
+  if (dateInput) dateInput.value = todayStr();
 
-    // --- Navigation ---
-    function switchView(viewName) {
-        document.querySelectorAll('.view-section').forEach(el => el.classList.add('hide'));
-        document.getElementById(`view-${viewName}`).classList.remove('hide');
-        
-        document.querySelectorAll('.bottom-nav button').forEach(el => {
-            el.classList.remove('text-indigo-600');
-            el.classList.add('text-gray-500');
-        });
-        
-        if (viewName !== 'settings') {
-            document.getElementById(`nav-${viewName}`).classList.remove('text-gray-500');
-            document.getElementById(`nav-${viewName}`).classList.add('text-indigo-600');
-        }
+  const payerSelect = $('bill-payer');
+  if (payerSelect) {
+    payerSelect.innerHTML = payerOptionsHtml('');
+    payerSelect.value = state.participants.indexOf(state.userName) !== -1 ? state.userName : '';
+  }
 
-        if (viewName === 'dashboard') renderDashboard();
-        if (viewName === 'history') renderHistory();
-        if (viewName === 'people') renderPeople();
-        if (viewName === 'settings') {
-            document.getElementById('setting-user-name').value = state.userName;
-            document.getElementById('setting-currency').value = state.currency;
-        }
-    }
+  const fileInput = $('bill-files');
+  if (fileInput) fileInput.value = '';
 
-    function updateAllViews() {
-        updateFilters(); // Ensure all dropdowns are synchronized
-        renderDashboard();
-        renderHistory();
-        renderPeople();
-        updateCurrencyDisplay();
-    }
+  const wrap = $('draft-items');
+  if (wrap) wrap.innerHTML = '';
+  draftRowSeq = 0;
+  addDraftItemRow();
 
-    // --- Attachments Logic ---
-    function handleFileSelect(event) {
-        const files = event.target.files;
-        if (!files || files.length === 0) return;
+  const categoryList = $('draft-category-list');
+  if (categoryList) categoryList.innerHTML = '';
+}
 
-        document.getElementById('submit-text').classList.add('hide');
-        document.getElementById('submit-loader').classList.remove('hide');
-        document.getElementById('submit-btn').disabled = true;
+function addDraftItemRow() {
+  const wrap = $('draft-items');
+  if (!wrap) return;
+  if (!state.participants.length) state.participants = [state.userName];
 
-        let processedCount = 0;
-        
-        Array.from(files).forEach(file => {
-            const reader = new FileReader();
-            reader.onload = function(e) {
-                stagedAttachments.push({
-                    name: file.name,
-                    type: file.type,
-                    data: e.target.result 
-                });
-                
-                processedCount++;
-                if (processedCount === files.length) {
-                    renderAttachmentPreviews();
-                    document.getElementById('submit-text').classList.remove('hide');
-                    document.getElementById('submit-loader').classList.add('hide');
-                    document.getElementById('submit-btn').disabled = false;
-                    event.target.value = ''; 
-                }
-            };
-            reader.readAsDataURL(file);
-        });
-    }
+  draftRowSeq += 1;
+  const row = document.createElement('div');
+  row.className = 'draft-item border border-gray-200 rounded-xl p-3 space-y-2 bg-gray-50/60';
+  row.dataset.row = String(draftRowSeq);
 
-    function renderAttachmentPreviews() {
-        const container = document.getElementById('attachment-previews');
-        container.innerHTML = '';
-        stagedAttachments.forEach((att, idx) => {
-            const isImage = att.type.startsWith('image/');
-            const iconHtml = isImage 
-                ? `<img src="${att.data}" class="w-10 h-10 object-cover rounded">`
-                : `<div class="w-10 h-10 bg-red-100 text-red-600 rounded flex items-center justify-center"><svg class="w-6 h-6" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 01-1-1zm1 3a1 1 0 100 2h6a1 1 0 100-2H7z" clip-rule="evenodd"></path></svg></div>`;
-            
-            container.innerHTML += `
-                <div class="flex items-center justify-between bg-white border border-gray-200 p-2 rounded shadow-sm">
-                    <div class="flex items-center gap-3 overflow-hidden">
-                        ${iconHtml}
-                        <span class="text-sm text-gray-700 truncate">${att.name}</span>
-                    </div>
-                    <button type="button" onclick="removeStagedAttachment(${idx})" class="text-red-500 hover:text-red-700 p-1">
-                        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12"></path></svg>
-                    </button>
-                </div>
-            `;
-        });
-    }
+  const peopleChips = state.participants.map(function (p, idx) {
+    return '<label class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border border-gray-200 bg-white text-xs font-medium text-gray-600 cursor-pointer">' +
+      '<input type="checkbox" checked class="draft-person w-3.5 h-3.5 text-indigo-600 rounded" data-idx="' + idx + '">' +
+      '<span>' + esc(p === state.userName ? p + ' (You)' : p) + '</span></label>';
+  }).join('');
 
-    function removeStagedAttachment(index) {
-        stagedAttachments.splice(index, 1);
-        renderAttachmentPreviews();
-    }
+  row.innerHTML =
+    '<div class="flex items-center justify-between">' +
+      '<span class="text-[10px] font-bold uppercase tracking-wider text-gray-400">Item</span>' +
+      '<button type="button" onclick="removeDraftRow(this)" class="text-gray-400 hover:text-red-500" title="Remove item">' +
+        svgIcon(ICON.close, 'w-4 h-4') + '</button>' +
+    '</div>' +
+    '<input type="text" class="draft-desc w-full border border-gray-300 rounded-lg p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Item name (e.g. Paneer Tikka)">' +
+    '<div class="grid grid-cols-2 gap-2">' +
+      '<input type="number" step="0.01" class="draft-amount w-full border border-gray-300 rounded-lg p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Amount">' +
+      '<input type="text" list="draft-category-list" class="draft-category w-full border border-gray-300 rounded-lg p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Category">' +
+    '</div>' +
+    '<div>' +
+      '<div class="flex items-center justify-between mb-1">' +
+        '<span class="text-[10px] font-bold uppercase tracking-wider text-gray-400">Split between</span>' +
+        '<div class="space-x-1 text-[10px]">' +
+          '<button type="button" onclick="setDraftRowPeople(this, true)" class="text-indigo-600 hover:underline font-semibold">All</button>' +
+          '<span class="text-gray-300">|</span>' +
+          '<button type="button" onclick="setDraftRowPeople(this, false)" class="text-indigo-600 hover:underline font-semibold">None</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="flex flex-wrap gap-1.5">' + peopleChips + '</div>' +
+    '</div>';
 
-    function openImageViewer(src, name) {
-        const img = document.getElementById('image-viewer-img');
-        const dl = document.getElementById('image-viewer-download');
-        img.src = src;
-        dl.href = src;
-        dl.download = name || "expense_receipt.jpg";
-        document.getElementById('image-viewer').classList.remove('hide');
-    }
+  wrap.appendChild(row);
+  const desc = row.querySelector('.draft-desc');
+  if (desc) desc.focus();
+}
 
-    function closeImageViewer() {
-        document.getElementById('image-viewer').classList.add('hide');
-        document.getElementById('image-viewer-img').src = '';
-    }
+function removeDraftRow(button) {
+  const row = button.closest('.draft-item');
+  if (row) row.remove();
+  const wrap = $('draft-items');
+  if (wrap && !wrap.querySelector('.draft-item')) addDraftItemRow();
+}
 
-    function downloadFile(dataUrl, fileName) {
-        const link = document.createElement('a');
-        link.href = dataUrl;
-        link.download = fileName;
-        document.body.appendChild(link);
-        link.click();
-        document.body.removeChild(link);
-    }
+function setDraftRowPeople(button, on) {
+  const row = button.closest('.draft-item');
+  if (!row) return;
+  Array.prototype.forEach.call(row.querySelectorAll('.draft-person'), function (chk) {
+    chk.checked = on;
+  });
+}
 
-    // --- Add & Edit Expense Form Logic ---
-    function openAddForm() {
-        editingExpenseId = null;
-        stagedAttachments = [];
-        populateAddExpenseForm();
-        renderAttachmentPreviews();
-        document.getElementById('form-title').innerText = "Add New Expense";
-        document.getElementById('submit-btn').querySelector('#submit-text').innerText = "Save Expense";
-        document.getElementById('cancel-edit-btn').classList.add('hide');
-        switchView('add');
-    }
+async function saveBill(event) {
+  event.preventDefault();
 
-    function populateAddExpenseForm() {
-        const payerSelect = document.getElementById('exp-payer');
-        const catSelect = document.getElementById('exp-category');
-        const dateInput = document.getElementById('exp-date');
-        
-        // Add default placeholders
-        payerSelect.innerHTML = `<option value="" disabled selected>Select who paid</option>` + 
-            state.participants.map(p => `<option value="${p}">${p}</option>`).join('');
-            
-        catSelect.innerHTML = `<option value="" disabled selected>Select category</option>` + 
-            state.categories.map(c => `<option value="${c}">${c}</option>`).join('');
-        
-        document.getElementById('expense-form').reset();
-        
-        // Default to today
-        dateInput.value = new Date().toISOString().split('T')[0];
-        
-        setSplitMethod('equal');
-    }
+  const name = ($('bill-name').value || '').trim();
+  const date = $('bill-date').value || todayStr();
+  const payer = $('bill-payer').value;
 
-    function addNewCategory() {
-        const newCat = prompt("Enter new category name:");
-        if (newCat && newCat.trim() !== '') {
-            const formattedCat = newCat.trim();
-            if (!state.categories.includes(formattedCat)) {
-                state.categories.push(formattedCat);
-                saveMetadataOnly();
-                updateFilters(); 
-                
-                const catSelect = document.getElementById('exp-category');
-                catSelect.innerHTML += `<option value="${formattedCat}">${formattedCat}</option>`;
-                catSelect.value = formattedCat;
-            }
-        }
-    }
+  if (!name) return alert('Give the bill a name.');
+  if (!payer) return alert('Select who paid this bill.');
 
-    function editExpense(id) {
-        const exp = expenses.find(e => e.id === id);
-        if (!exp) return;
+  const rows = Array.prototype.slice.call(document.querySelectorAll('#draft-items .draft-item'));
+  if (!rows.length) return alert('Add at least one item.');
 
-        editingExpenseId = id;
-        stagedAttachments = exp.attachments ? JSON.parse(JSON.stringify(exp.attachments)) : [];
-        
-        const payerSelect = document.getElementById('exp-payer');
-        const catSelect = document.getElementById('exp-category');
-        
-        payerSelect.innerHTML = `<option value="" disabled>Select who paid</option>` + 
-            state.participants.map(p => `<option value="${p}">${p}</option>`).join('');
-            
-        catSelect.innerHTML = `<option value="" disabled>Select category</option>` + 
-            state.categories.map(c => `<option value="${c}">${c}</option>`).join('');
-
-        switchView('add');
-
-        document.getElementById('form-title').innerText = "Edit Expense";
-        document.getElementById('submit-btn').querySelector('#submit-text').innerText = "Update Expense";
-        document.getElementById('cancel-edit-btn').classList.remove('hide');
-
-        document.getElementById('exp-desc').value = exp.description;
-        document.getElementById('exp-amount').value = exp.amount;
-        document.getElementById('exp-category').value = exp.category;
-        
-        // Ensure Date is formatted for the input
-        const dateObj = new Date(exp.date);
-        document.getElementById('exp-date').value = dateObj.toISOString().split('T')[0];
-        
-        document.getElementById('exp-payer').value = exp.paidBy;
-
-        setSplitMethod(exp.splitMethod);
-        renderAttachmentPreviews();
-
-        if (exp.splitMethod === 'equal') {
-            document.querySelectorAll('.split-participant-check').forEach(chk => {
-                chk.checked = !!exp.splits[chk.getAttribute('data-name')];
-            });
-        } else if (exp.splitMethod === 'exact') {
-            document.querySelectorAll('.split-amount-input').forEach(inp => {
-                const name = inp.getAttribute('data-name');
-                inp.value = exp.splits[name] ? exp.splits[name].toFixed(2) : '';
-            });
-        } else if (exp.splitMethod === 'percentage') {
-            document.querySelectorAll('.split-percent-input').forEach(inp => {
-                const name = inp.getAttribute('data-name');
-                if (exp.splits[name]) { inp.value = ((exp.splits[name] / exp.amount) * 100).toFixed(1); }
-            });
-        }
-    }
-
-    function setSplitMethod(method) {
-        state.currentSplitMethod = method;
-        
-        ['equal', 'exact', 'percentage'].forEach(m => {
-            const btn = document.getElementById(`btn-split-${m}`);
-            if (m === method) {
-                btn.className = "flex-1 py-1.5 rounded-md text-sm font-medium bg-white shadow-sm transition-all text-indigo-600";
-            } else {
-                btn.className = "flex-1 py-1.5 rounded-md text-sm font-medium text-gray-600 hover:bg-gray-200 transition-all";
-            }
-        });
-
-        const container = document.getElementById('split-details');
-        container.innerHTML = '';
-        
-        state.participants.forEach(p => {
-            let inputHtml = '';
-            if (method === 'equal') {
-                inputHtml = `<input type="checkbox" checked class="split-participant-check w-4 h-4 text-indigo-600" data-name="${p}">`;
-            } else if (method === 'exact') {
-                inputHtml = `
-                    <div class="flex items-center gap-1">
-                        <span class="text-gray-500 text-sm currency-display">${state.currency}</span>
-                        <input type="number" min="0" step="0.01" placeholder="0.00" class="split-amount-input w-20 border rounded px-2 py-1 text-sm outline-none" data-name="${p}">
-                    </div>`;
-            } else if (method === 'percentage') {
-                inputHtml = `
-                    <div class="flex items-center gap-1">
-                        <input type="number" min="0" max="100" step="0.1" placeholder="0" class="split-percent-input w-16 border rounded px-2 py-1 text-sm outline-none" data-name="${p}">
-                        <span class="text-gray-500 text-sm">%</span>
-                    </div>`;
-            }
-
-            container.innerHTML += `
-                <div class="flex justify-between items-center bg-white p-2 rounded border border-gray-100">
-                    <span class="text-sm font-medium text-gray-700">${p} ${p === state.userName ? '(You)' : ''}</span>
-                    ${inputHtml}
-                </div>
-            `;
-        });
-    }
-
-    document.getElementById('expense-form').addEventListener('submit', async (e) => {
-        e.preventDefault();
-        
-        const desc = document.getElementById('exp-desc').value.trim();
-        const amount = parseFloat(document.getElementById('exp-amount').value);
-        const dateVal = document.getElementById('exp-date').value;
-        const category = document.getElementById('exp-category').value;
-        const payer = document.getElementById('exp-payer').value;
-        const errorMsg = document.getElementById('split-error');
-        
-        errorMsg.classList.add('hide');
-
-        if (!category) {
-            errorMsg.innerText = "Please select a category.";
-            errorMsg.classList.remove('hide');
-            return;
-        }
-
-        if (!payer) {
-            errorMsg.innerText = "Please select who paid the expense.";
-            errorMsg.classList.remove('hide');
-            return;
-        }
-
-        let splits = {};
-        
-        if (state.currentSplitMethod === 'equal') {
-            const checks = document.querySelectorAll('.split-participant-check:checked');
-            if (checks.length === 0) {
-                errorMsg.innerText = "Select at least one person to split with."; errorMsg.classList.remove('hide'); return;
-            }
-            const splitAmount = amount / checks.length;
-            checks.forEach(chk => { splits[chk.getAttribute('data-name')] = splitAmount; });
-        } 
-        else if (state.currentSplitMethod === 'exact') {
-            let sum = 0;
-            document.querySelectorAll('.split-amount-input').forEach(inp => {
-                const val = parseFloat(inp.value) || 0;
-                if (val > 0) splits[inp.getAttribute('data-name')] = val;
-                sum += val;
-            });
-            if (Math.abs(sum - amount) > 0.01) {
-                errorMsg.innerText = `Amounts must sum up to ${formatMoney(amount)}. Current sum: ${formatMoney(sum)}`; errorMsg.classList.remove('hide'); return;
-            }
-        } 
-        else if (state.currentSplitMethod === 'percentage') {
-            let sum = 0;
-            document.querySelectorAll('.split-percent-input').forEach(inp => {
-                const val = parseFloat(inp.value) || 0;
-                if (val > 0) splits[inp.getAttribute('data-name')] = (val / 100) * amount;
-                sum += val;
-            });
-            if (Math.abs(sum - 100) > 0.01) {
-                errorMsg.innerText = `Percentages must sum up to 100%. Current sum: ${sum}%`; errorMsg.classList.remove('hide'); return;
-            }
-        }
-
-        try {
-            document.getElementById('submit-btn').disabled = true;
-            
-            // Create proper ISO date string from input
-            const fullDateStr = new Date(dateVal).toISOString();
-
-            let expenseObj = {
-                id: editingExpenseId || Date.now(),
-                date: fullDateStr,
-                description: desc,
-                amount: amount,
-                category: category,
-                paidBy: payer,
-                splitMethod: state.currentSplitMethod,
-                splits: splits,
-                settled: false, // Default to not settled
-                attachments: [...stagedAttachments]
-            };
-
-            // If editing, preserve the old settled status
-            if (editingExpenseId) {
-                const existing = expenses.find(e => e.id === editingExpenseId);
-                if (existing && existing.settled) {
-                    expenseObj.settled = true;
-                }
-            }
-
-            await dbSaveExpense(expenseObj);
-
-            if (editingExpenseId) {
-                const idx = expenses.findIndex(e => e.id === editingExpenseId);
-                if (idx !== -1) expenses[idx] = expenseObj;
-            } else {
-                expenses.push(expenseObj);
-            }
-
-            stagedAttachments = [];
-            editingExpenseId = null;
-            updateAllViews();
-            switchView('history');
-            
-        } catch (err) {
-            alert("Error saving expense: " + err.message);
-        } finally {
-            document.getElementById('submit-btn').disabled = false;
-        }
+  const drafts = [];
+  for (const row of rows) {
+    const desc = row.querySelector('.draft-desc').value.trim();
+    const amount = parseFloat(row.querySelector('.draft-amount').value);
+    const category = row.querySelector('.draft-category').value.trim() || 'Uncategorised';
+    const people = Array.prototype.slice.call(row.querySelectorAll('.draft-person:checked')).map(function (chk) {
+      return state.participants[Number(chk.dataset.idx)];
     });
 
-    // --- History & Timeline ---
-    function renderHistory() {
-        const list = document.getElementById('history-list');
-        list.innerHTML = '';
-        
-        // Filter Data specifically for Timeline view
-        const filteredExpenses = applyFilters(expenses, 'hist');
+    if (!desc) return alert('Every item needs a name.');
+    if (!isFinite(amount) || amount === 0) return alert('Item "' + desc + '" needs a non-zero amount.');
+    if (!people.length) return alert('Tick at least one person for "' + desc + '".');
+    drafts.push({ description: desc, amount: amount, category: category, people: people });
+  }
 
-        if (filteredExpenses.length === 0) {
-            list.innerHTML = `
-                <div class="text-center py-10 bg-white rounded-xl border border-gray-200 shadow-sm mt-4">
-                    <p class="text-gray-500">No expenses found matching the criteria.</p>
-                </div>`;
-            return;
-        }
+  try {
+    const projectId = uid();
+    const categories = Array.from(new Set(drafts.map(function (d) { return d.category; })));
+    const project = {
+      id: projectId,
+      name: name,
+      date: isoFromDateOnly(date),
+      payer: payer,
+      categories: categories,
+      attachments: stagedBillAttachments.slice(),
+      createdAt: Date.now()
+    };
+    await dbPut(STORE_PROJECTS, project);
+    projects.push(project);
 
-        // Sort by date (descending)
-        const sortedExpenses = [...filteredExpenses].sort((a, b) => new Date(b.date) - new Date(a.date));
+    for (let i = 0; i < drafts.length; i += 1) {
+      const draft = drafts[i];
+      const item = {
+        id: uid(),
+        projectId: projectId,
+        order: i,
+        date: project.date,
+        description: draft.description,
+        category: draft.category,
+        amount: draft.amount,
+        paidBy: payer,
+        splitMethod: 'equal',
+        splits: equalSplits(draft.amount, draft.people),
+        settled: false,
+        attachments: []
+      };
+      await dbPut(STORE_ITEMS, item);
+      items.push(item);
+    }
 
-        // Group by Date for Timeline
-        const groupedExpenses = {};
-        sortedExpenses.forEach(exp => {
-            const dateObj = new Date(exp.date);
-            // Ignore time portion for grouping by day
-            const dateStr = dateObj.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' });
-            if (!groupedExpenses[dateStr]) {
-                groupedExpenses[dateStr] = [];
+    expandedProjectIds.add(projectId);
+    resetAddForm();
+    switchView('history');
+    updateAllViews();
+    alert('Saved "' + name + '" with ' + drafts.length + ' item(s).');
+  } catch (err) {
+    alert('Could not save the bill: ' + err.message);
+  }
+}
+
+/* --------------------------- bill modal -------------------------- */
+
+function openBillModal(projectId) {
+  const project = projectById(projectId);
+  if (!project) return;
+  editingBillId = projectId;
+  billModalAttachments = JSON.parse(JSON.stringify(project.attachments || []));
+
+  const title = $('modal-bill-title');
+  if (title) title.textContent = project.name;
+  $('bill-modal-name').value = project.name;
+  $('bill-modal-date').value = toDateOnly(project.date);
+  const payer = $('bill-modal-payer');
+  payer.innerHTML = payerOptionsHtml(project.payer);
+  payer.value = project.payer;
+
+  renderBillModalAttachments();
+  $('modal-bill').classList.remove('hide');
+}
+
+function closeBillModal() {
+  const modal = $('modal-bill');
+  if (modal) modal.classList.add('hide');
+  editingBillId = null;
+  billModalAttachments = [];
+}
+
+async function saveBillModal(event) {
+  event.preventDefault();
+  const project = projectById(editingBillId);
+  if (!project) return;
+
+  const name = $('bill-modal-name').value.trim();
+  const date = $('bill-modal-date').value || todayStr();
+  const payer = $('bill-modal-payer').value;
+
+  if (!name) return alert('Give the bill a name.');
+  if (!payer) return alert('Select who paid this bill.');
+
+  project.name = name;
+  project.date = isoFromDateOnly(date);
+  project.payer = payer;
+  project.attachments = billModalAttachments.slice();
+
+  try {
+    await dbPut(STORE_PROJECTS, project);
+    const own = itemsOfProject(project.id);
+    for (const item of own) {
+      item.paidBy = payer;
+      item.date = project.date;
+      await dbPut(STORE_ITEMS, item);
+    }
+    closeBillModal();
+    updateAllViews();
+  } catch (err) {
+    alert('Could not save the bill: ' + err.message);
+  }
+}
+
+/* --------------------------- item modal -------------------------- */
+
+function nextOrder(projectId) {
+  return itemsOfProject(projectId).reduce(function (max, it) {
+    return Math.max(max, Number(it.order) || 0);
+  }, -1) + 1;
+}
+
+function openItemModal(projectId, itemId) {
+  const project = projectById(projectId);
+  if (!project) return;
+
+  editingItem = { projectId: projectId, itemId: itemId || null };
+  const item = itemId ? items.find(function (i) { return i.id === itemId; }) : null;
+
+  const title = $('modal-item-title');
+  if (title) title.textContent = item ? 'Edit item' : 'Add item';
+  const subtitle = $('modal-item-subtitle');
+  if (subtitle) subtitle.textContent = project.name;
+
+  $('item-modal-desc').value = item ? item.description : '';
+  $('item-modal-amount').value = item ? item.amount : '';
+  $('item-modal-category').value = item ? item.category : '';
+
+  const categories = Array.from(new Set(
+    (project.categories || []).concat(itemsOfProject(projectId).map(function (i) { return i.category; }).filter(Boolean))
+  ));
+  $('item-category-list').innerHTML = categories.map(function (c) {
+    return '<option value="' + esc(c) + '"></option>';
+  }).join('');
+
+  const splitKeys = item && item.splits ? Object.keys(item.splits) : [];
+  itemModalPeople = new Set(splitKeys.length ? splitKeys : state.participants.slice());
+
+  renderItemModalChips();
+  $('modal-item').classList.remove('hide');
+}
+
+function closeItemModal() {
+  const modal = $('modal-item');
+  if (modal) modal.classList.add('hide');
+  editingItem = null;
+  itemModalPeople = new Set();
+}
+
+function renderItemModalChips() {
+  const box = $('item-modal-people');
+  if (!box || !editingItem) return;
+
+  const amount = parseFloat($('item-modal-amount').value) || 0;
+  const people = Array.from(itemModalPeople);
+  const share = people.length ? amount / people.length : 0;
+
+  box.innerHTML = state.participants.map(function (p, idx) {
+    const on = itemModalPeople.has(p);
+    return '<label class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium cursor-pointer select-none ' +
+      (on ? 'bg-indigo-50 border-indigo-300 text-indigo-900' : 'bg-white border-gray-200 text-gray-500') + '">' +
+      '<input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleItemPerson(' + idx + ', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300">' +
+      '<span>' + esc(p) + '</span>' +
+      (on ? '<span class="text-[10px] text-indigo-600 font-bold">' + money(share) + '</span>' : '') +
+    '</label>';
+  }).join('');
+}
+
+function toggleItemPerson(index, checked) {
+  const person = state.participants[index];
+  if (!person) return;
+  if (checked) itemModalPeople.add(person);
+  else itemModalPeople.delete(person);
+  renderItemModalChips();
+}
+
+function setItemModalPeople(on) {
+  itemModalPeople = new Set(on ? state.participants.slice() : []);
+  renderItemModalChips();
+}
+
+async function saveItemModal(event) {
+  event.preventDefault();
+  if (!editingItem) return;
+
+  const project = projectById(editingItem.projectId);
+  if (!project) return;
+
+  const desc = $('item-modal-desc').value.trim();
+  const amount = parseFloat($('item-modal-amount').value);
+  const category = $('item-modal-category').value.trim() || 'Uncategorised';
+  const people = Array.from(itemModalPeople);
+
+  if (!desc) return alert('Give the item a name.');
+  if (!isFinite(amount) || amount === 0) return alert('Enter a non-zero amount.');
+  if (!people.length) return alert('Tick at least one person for this item.');
+
+  try {
+    project.categories = project.categories || [];
+    if (project.categories.indexOf(category) === -1) {
+      project.categories.push(category);
+      await dbPut(STORE_PROJECTS, project);
+    }
+
+    let item = editingItem.itemId
+      ? items.find(function (i) { return i.id === editingItem.itemId; })
+      : null;
+
+    if (item) {
+      item.description = desc;
+      item.amount = amount;
+      item.category = category;
+      item.splits = equalSplits(amount, people);
+      item.splitMethod = 'equal';
+      await dbPut(STORE_ITEMS, item);
+    } else {
+      item = {
+        id: uid(),
+        projectId: project.id,
+        order: nextOrder(project.id),
+        date: project.date,
+        description: desc,
+        category: category,
+        amount: amount,
+        paidBy: project.payer,
+        splitMethod: 'equal',
+        splits: equalSplits(amount, people),
+        settled: false,
+        attachments: []
+      };
+      await dbPut(STORE_ITEMS, item);
+      items.push(item);
+    }
+
+    closeItemModal();
+    updateAllViews();
+  } catch (err) {
+    alert('Could not save the item: ' + err.message);
+  }
+}
+
+
+/* --------------------------- timeline ---------------------------- */
+
+function involvedPeople(project, projectItems) {
+  const names = [];
+  function add(name) {
+    if (!name) return;
+    if (!names.some(function (existing) { return samePerson(existing, name); })) names.push(name);
+  }
+  add(project.payer);
+  projectItems.forEach(function (item) {
+    if (item.splits) Object.keys(item.splits).forEach(add);
+  });
+  return names;
+}
+
+function personChips(names, limit) {
+  const max = limit || 4;
+  let html = names.slice(0, max).map(function (name) {
+    return '<span class="inline-flex items-center px-1.5 py-0.5 rounded-full bg-indigo-50 text-indigo-700 text-[10px] font-medium border border-indigo-100">' +
+      esc(name === state.userName ? 'You' : name) + '</span>';
+  }).join('');
+  if (names.length > max) {
+    html += '<span class="text-[10px] text-gray-400">+' + (names.length - max) + '</span>';
+  }
+  return html;
+}
+
+function renderHistory() {
+  const list = $('history-list');
+  if (!list) return;
+
+  const filtered = filterItems('hist');
+  if (!filtered.length) {
+    list.innerHTML = '<div class="text-center py-10 bg-white rounded-xl border border-gray-200 shadow-sm mt-4">' +
+      '<p class="text-gray-500">No bills match the filters.</p></div>';
+    return;
+  }
+
+  const grouped = new Map();
+  filtered.forEach(function (item) {
+    if (!grouped.has(item.projectId)) grouped.set(item.projectId, []);
+    grouped.get(item.projectId).push(item);
+  });
+
+  const cards = [];
+  grouped.forEach(function (matchedItems, projectId) {
+    const project = projectById(projectId);
+    if (project) cards.push({ project: project, items: matchedItems });
+  });
+
+  cards.sort(function (a, b) {
+    const dateA = new Date(a.project.date).getTime();
+    const dateB = new Date(b.project.date).getTime();
+    if (dateA !== dateB) return dateB - dateA;
+    return (b.project.createdAt || 0) - (a.project.createdAt || 0);
+  });
+
+  let html = '';
+  let lastLabel = '';
+  cards.forEach(function (card) {
+    const label = dateLabel(card.project.date);
+    if (label !== lastLabel) {
+      html += '<div class="sticky top-0 z-10 bg-gray-100/90 backdrop-blur pt-4 pb-2 mt-2">' +
+        '<h3 class="text-xs font-bold text-indigo-800 uppercase tracking-wider">' + esc(label) + '</h3></div>';
+      lastLabel = label;
+    }
+    html += billCardHtml(card.project, card.items);
+  });
+
+  list.innerHTML = html;
+}
+
+function billCardHtml(project, matchedItems) {
+  const allItems = itemsOfProject(project.id);
+  const isSubset = matchedItems.length !== allItems.length;
+  const total = matchedItems.reduce(function (sum, it) { return sum + (Number(it.amount) || 0); }, 0);
+  const allTotal = allItems.reduce(function (sum, it) { return sum + (Number(it.amount) || 0); }, 0);
+  const allSettled = allItems.length > 0 && allItems.every(function (it) { return !!it.settled; });
+  const someSettled = !allSettled && allItems.some(function (it) { return !!it.settled; });
+  const expanded = expandedProjectIds.has(project.id);
+  const people = involvedPeople(project, allItems);
+  const sortedItems = matchedItems.slice().sort(function (a, b) {
+    return (Number(a.order) || 0) - (Number(b.order) || 0);
+  });
+
+  let badge = '';
+  if (allSettled) {
+    badge = '<span class="bg-emerald-100 text-emerald-700 text-[9px] px-1.5 py-0.5 rounded-full uppercase tracking-wider font-bold">Settled</span>';
+  } else if (someSettled) {
+    badge = '<span class="bg-amber-100 text-amber-700 text-[9px] px-1.5 py-0.5 rounded-full uppercase tracking-wider font-bold">Partly settled</span>';
+  }
+
+  const metaLine = 'Paid by <span class="font-semibold text-gray-700">' +
+    esc(project.payer === state.userName ? 'You' : project.payer) + '</span>' +
+    ' &middot; ' + allItems.length + ' item' + (allItems.length === 1 ? '' : 's') +
+    (isSubset ? ' &middot; showing ' + matchedItems.length : '');
+
+  let html = '<div class="bg-white rounded-xl border border-gray-200 shadow-sm overflow-hidden">' +
+    '<div role="button" tabindex="0" onclick="toggleProjectExpand(' + project.id + ')" class="w-full text-left p-4 flex items-start gap-3 cursor-pointer">' +
+      '<div class="flex-1 min-w-0">' +
+        '<div class="flex items-center gap-2 flex-wrap">' +
+          '<h4 class="font-bold text-gray-800 text-base break-words">' + esc(project.name) + '</h4>' + badge +
+        '</div>' +
+        '<p class="text-[11px] text-gray-500 mt-1">' + metaLine + '</p>' +
+        '<div class="flex flex-wrap gap-1 mt-2">' + personChips(people, 4) + '</div>' +
+      '</div>' +
+      '<div class="text-right flex-shrink-0 pl-1">' +
+        '<p class="font-bold text-indigo-600 text-base">' + money(isSubset ? total : allTotal) + '</p>' +
+        '<p class="text-[10px] text-gray-400 mt-1">' + (expanded ? '&#9652;' : '&#9662;') + '</p>' +
+      '</div>' +
+    '</div>';
+
+  if (expanded) {
+    html += '<div class="border-t border-gray-100 bg-gray-50/70 px-3 py-3">';
+    html += sortedItems.map(itemRowHtml).join('');
+    if (isSubset) {
+      html += '<p class="text-[10px] text-gray-400 mt-2">Showing ' + matchedItems.length +
+        ' of ' + allItems.length + ' items because filters are active.</p>';
+    }
+    html += '<div class="flex flex-wrap gap-1.5 mt-3">' +
+      '<button type="button" onclick="openItemModal(' + project.id + ')" class="text-[11px] font-semibold bg-indigo-600 text-white px-2.5 py-1.5 rounded-lg hover:bg-indigo-700">+ Add item</button>' +
+      '<button type="button" onclick="openBillModal(' + project.id + ')" class="text-[11px] font-semibold bg-white border border-gray-300 text-gray-700 px-2.5 py-1.5 rounded-lg hover:bg-gray-100">Edit bill</button>' +
+      '<button type="button" onclick="toggleProjectSettled(' + project.id + ')" class="text-[11px] font-semibold bg-white border border-gray-300 text-gray-700 px-2.5 py-1.5 rounded-lg hover:bg-gray-100">' +
+        (allSettled ? 'Unsettle all' : 'Settle all') + '</button>' +
+      '<button type="button" onclick="deleteProject(' + project.id + ')" class="text-[11px] font-semibold bg-white border border-red-200 text-red-600 px-2.5 py-1.5 rounded-lg hover:bg-red-50">Delete</button>' +
+    '</div>';
+    html += projectAttachmentHtml(project);
+    html += '</div>';
+  }
+
+  html += '</div>';
+  return html;
+}
+
+function itemRowHtml(item) {
+  const splits = Object.entries(item.splits || {});
+  const settled = !!item.settled;
+  const shareChips = splits.length
+    ? splits.map(function (entry) {
+        return '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-indigo-50 border border-indigo-100 text-[10px] text-indigo-800">' +
+          esc(entry[0] === state.userName ? 'You' : entry[0]) +
+          ' <b>' + money(entry[1]) + '</b></span>';
+      }).join('')
+    : '<span class="text-[10px] text-gray-400">No people set</span>';
+
+  const amountClass = Number(item.amount) < 0 ? 'text-emerald-600' : 'text-gray-800';
+
+  return '<div class="bg-white border border-gray-200 rounded-lg p-2.5 mb-2 ' + (settled ? 'opacity-60' : '') + '">' +
+    '<div class="flex items-start justify-between gap-2">' +
+      '<div class="min-w-0">' +
+        '<p class="text-sm font-semibold text-gray-800 break-words ' + (settled ? 'line-through decoration-gray-300' : '') + '">' +
+          esc(item.description) + '</p>' +
+        '<p class="mt-0.5"><span class="bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded text-[10px]">' + esc(item.category) + '</span></p>' +
+      '</div>' +
+      '<p class="font-mono text-sm font-bold flex-shrink-0 ' + amountClass + '">' + money(item.amount) + '</p>' +
+    '</div>' +
+    '<div class="flex flex-wrap gap-1 mt-1.5">' + shareChips + '</div>' +
+    '<div class="flex items-center justify-end gap-1 mt-1">' +
+      '<button type="button" onclick="toggleItemSettled(' + item.id + ')" class="p-1 ' + (settled ? 'text-emerald-500' : 'text-gray-300 hover:text-emerald-500') + '" title="' + (settled ? 'Mark unsettled' : 'Mark settled') + '">' +
+        svgIcon(ICON.check, 'w-5 h-5') + '</button>' +
+      '<button type="button" onclick="openItemModal(' + item.projectId + ', ' + item.id + ')" class="p-1 text-gray-400 hover:text-indigo-600" title="Edit item">' +
+        svgIcon(ICON.pencil, 'w-4 h-4') + '</button>' +
+      '<button type="button" onclick="deleteItem(' + item.id + ')" class="p-1 text-gray-400 hover:text-red-500" title="Delete item">' +
+        svgIcon(ICON.trash, 'w-4 h-4') + '</button>' +
+    '</div>' +
+  '</div>';
+}
+
+function toggleProjectExpand(projectId) {
+  if (expandedProjectIds.has(projectId)) expandedProjectIds.delete(projectId);
+  else expandedProjectIds.add(projectId);
+  renderHistory();
+}
+
+async function toggleItemSettled(itemId) {
+  const item = items.find(function (i) { return i.id === itemId; });
+  if (!item) return;
+  item.settled = !item.settled;
+  await dbPut(STORE_ITEMS, item);
+  updateAllViews();
+}
+
+async function toggleProjectSettled(projectId) {
+  const own = itemsOfProject(projectId);
+  if (!own.length) return;
+  const allSettled = own.every(function (it) { return !!it.settled; });
+  for (const item of own) {
+    item.settled = !allSettled;
+    await dbPut(STORE_ITEMS, item);
+  }
+  updateAllViews();
+}
+
+async function deleteItem(itemId) {
+  const item = items.find(function (i) { return i.id === itemId; });
+  if (!item) return;
+  if (!confirm('Delete item "' + item.description + '"?')) return;
+
+  await dbDelete(STORE_ITEMS, item.id);
+  items = items.filter(function (i) { return i.id !== item.id; });
+
+  const remaining = itemsOfProject(item.projectId);
+  if (!remaining.length) {
+    await dbDelete(STORE_PROJECTS, item.projectId);
+    projects = projects.filter(function (p) { return p.id !== item.projectId; });
+    expandedProjectIds.delete(item.projectId);
+  }
+  updateAllViews();
+}
+
+async function deleteProject(projectId) {
+  const project = projectById(projectId);
+  if (!project) return;
+  const own = itemsOfProject(projectId);
+  if (!confirm('Delete bill "' + project.name + '" and its ' + own.length + ' item(s)?')) return;
+
+  for (const item of own) await dbDelete(STORE_ITEMS, item.id);
+  await dbDelete(STORE_PROJECTS, projectId);
+
+  items = items.filter(function (i) { return i.projectId !== projectId; });
+  projects = projects.filter(function (p) { return p.id !== projectId; });
+  expandedProjectIds.delete(projectId);
+  updateAllViews();
+}
+
+/* ----------------------------- people ---------------------------- */
+
+function renderPeople() {
+  const list = $('people-list');
+  if (!list) return;
+  list.innerHTML = state.participants.map(function (person, index) {
+    const isUser = person === state.userName;
+    return '<li class="flex justify-between items-center p-3 hover:bg-gray-50">' +
+      '<span class="font-medium text-gray-700">' + esc(person) +
+        (isUser ? '<span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-2">You</span>' : '') +
+      '</span>' +
+      '<button onclick="removePerson(' + index + ')" class="text-red-500 hover:text-red-700 p-1" ' +
+        (isUser ? 'disabled style="opacity:0.2"' : '') + '>' + svgIcon(ICON.trash, 'w-5 h-5') + '</button>' +
+    '</li>';
+  }).join('');
+}
+
+async function addPerson(event) {
+  event.preventDefault();
+  const input = $('new-person-name');
+  const name = (input.value || '').trim();
+  if (!name) return;
+  if (state.participants.some(function (p) { return samePerson(p, name); })) {
+    return alert('That person is already in the list.');
+  }
+  state.participants.push(name);
+  input.value = '';
+  await saveMeta();
+  updateAllViews();
+}
+
+async function removePerson(index) {
+  const name = state.participants[index];
+  if (!name || name === state.userName) return;
+  const involved = items.some(function (item) {
+    return item.paidBy === name || (item.splits && item.splits[name] !== undefined);
+  });
+  if (involved) return alert('Cannot remove ' + name + ' - they appear in existing bills.');
+  state.participants.splice(index, 1);
+  await saveMeta();
+  updateAllViews();
+}
+
+
+/* ---------------------------- analytics -------------------------- */
+
+function renderDashboard() {
+  const filtered = filterItems('dash');
+
+  const total = filtered.reduce(function (sum, it) { return sum + (Number(it.amount) || 0); }, 0);
+  const personal = filtered.reduce(function (sum, it) {
+    return sum + (it.splits && Number(it.splits[state.userName]) ? Number(it.splits[state.userName]) : 0);
+  }, 0);
+
+  const totalEl = $('dash-total');
+  if (totalEl) totalEl.textContent = money(total);
+  const personalEl = $('dash-personal');
+  if (personalEl) personalEl.textContent = money(personal);
+
+  const unsettled = filtered.filter(function (it) { return !it.settled; });
+  const balances = {};
+  state.participants.forEach(function (p) { balances[p] = 0; });
+  unsettled.forEach(function (it) {
+    if (balances[it.paidBy] !== undefined) balances[it.paidBy] += Number(it.amount) || 0;
+    Object.keys(it.splits || {}).forEach(function (person) {
+      if (balances[person] !== undefined) balances[person] -= Number(it.splits[person]) || 0;
+    });
+  });
+
+  const box = $('transparency-box');
+  if (box) {
+    let html = '<div class="space-y-2"><div class="flex items-center gap-2 border-b border-gray-200 pb-2">' +
+      '<strong>Net Balance = Total Paid - Total Share</strong></div>';
+    let hasData = false;
+    state.participants.forEach(function (p) {
+      const paid = unsettled.filter(function (it) { return it.paidBy === p; })
+        .reduce(function (sum, it) { return sum + (Number(it.amount) || 0); }, 0);
+      const share = unsettled.reduce(function (sum, it) {
+        return sum + ((it.splits && Number(it.splits[p])) || 0);
+      }, 0);
+      const bal = paid - share;
+      if (paid !== 0 || share !== 0) {
+        hasData = true;
+        const balColor = bal > 0.01 ? 'text-emerald-600' : (bal < -0.01 ? 'text-red-500' : 'text-gray-500');
+        const balSign = bal > 0.01 ? '+' : '';
+        html += '<div class="flex justify-between items-center py-1 border-b border-gray-100 last:border-0">' +
+          '<span class="font-medium text-gray-700">' + esc(p) + '</span>' +
+          '<span class="text-gray-500 text-[11px] sm:text-xs">Paid ' + money(paid) +
+            ' &minus; Share ' + money(share) + ' = ' +
+            '<span class="font-bold ' + balColor + ' text-sm">' + balSign + money(bal) + '</span></span>' +
+        '</div>';
+      }
+    });
+    if (!hasData) html += '<p class="text-gray-500 italic py-1">No active unsettled expenses.</p>';
+    html += '</div>';
+    box.innerHTML = html;
+  }
+
+  const debtors = [];
+  const creditors = [];
+  Object.keys(balances).forEach(function (person) {
+    const balance = balances[person];
+    if (balance < -0.01) debtors.push({ person: person, amount: Math.abs(balance) });
+    else if (balance > 0.01) creditors.push({ person: person, amount: balance });
+  });
+  debtors.sort(function (a, b) { return b.amount - a.amount; });
+  creditors.sort(function (a, b) { return b.amount - a.amount; });
+
+  const settlements = [];
+  let i = 0;
+  let j = 0;
+  while (i < debtors.length && j < creditors.length) {
+    const debtor = debtors[i];
+    const creditor = creditors[j];
+    const amount = Math.min(debtor.amount, creditor.amount);
+    if (amount > 0.004) {
+      const dName = debtor.person === state.userName ? 'You' : debtor.person;
+      const cName = creditor.person === state.userName ? 'You' : creditor.person;
+      settlements.push(dName + ' owe' + (dName === 'You' ? '' : 's') + ' ' + cName +
+        ' <span class="font-bold text-gray-800">' + money(amount) + '</span>');
+    }
+    debtor.amount -= amount;
+    creditor.amount -= amount;
+    if (debtor.amount < 0.01) i += 1;
+    if (creditor.amount < 0.01) j += 1;
+  }
+
+  const balanceList = $('balances-list');
+  if (balanceList) {
+    balanceList.innerHTML = settlements.length === 0
+      ? '<p class="text-emerald-600 text-sm font-medium flex items-center gap-1">' +
+          svgIcon(ICON.check, 'w-4 h-4') + ' All balances are settled up!</p>'
+      : settlements.map(function (line) {
+          return '<div class="flex items-center gap-2 border-l-4 border-orange-400 pl-3 py-1 bg-orange-50 rounded-r">' +
+            '<span class="text-orange-700">&#10132;</span> <span>' + line + '</span></div>';
+        }).join('');
+  }
+
+  renderDateChart(filtered);
+  renderPeopleChart(filtered);
+  renderCategoryChart(filtered);
+}
+
+function renderDateChart(data) {
+  const canvas = $('dateCategoryChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const ctx = canvas.getContext('2d');
+
+  const dateMap = {};
+  data.forEach(function (it) {
+    const iso = toDateOnly(it.date);
+    if (!dateMap[iso]) dateMap[iso] = {};
+    dateMap[iso][it.category] = (dateMap[iso][it.category] || 0) + (Number(it.amount) || 0);
+  });
+
+  const dates = Object.keys(dateMap).sort();
+  const labels = dates.map(function (d) {
+    const p = d.split('-');
+    return new Date(Number(p[0]), Number(p[1]) - 1, Number(p[2]), 12)
+      .toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
+  });
+
+  const categories = Array.from(new Set(data.map(function (it) { return it.category; })));
+  const palette = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#64748b', '#14b8a6', '#f43f5e'];
+  const datasets = categories.map(function (cat, idx) {
+    return {
+      label: cat,
+      data: dates.map(function (d) { return dateMap[d][cat] || 0; }),
+      backgroundColor: palette[idx % palette.length]
+    };
+  }).filter(function (ds) {
+    return ds.data.some(function (v) { return v !== 0; });
+  });
+
+  if (chartInstances.date) chartInstances.date.destroy();
+
+  if (!labels.length) {
+    chartInstances.date = new Chart(ctx, {
+      type: 'bar',
+      data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } }
+    });
+    return;
+  }
+
+  chartInstances.date = new Chart(ctx, {
+    type: 'bar',
+    data: { labels: labels, datasets: datasets },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      scales: { x: { stacked: true }, y: { stacked: true } },
+      plugins: {
+        legend: { position: 'top', labels: { boxWidth: 12, font: { size: 11 } } },
+        tooltip: {
+          mode: 'index',
+          intersect: false,
+          callbacks: {
+            label: function (context) {
+              if (context.raw) return ' ' + context.dataset.label + ': ' + money(context.raw);
+              return undefined;
+            },
+            footer: function (tooltipItems) {
+              const sum = tooltipItems.reduce(function (s, item) { return s + item.raw; }, 0);
+              return 'Total: ' + money(sum);
             }
-            groupedExpenses[dateStr].push(exp);
-        });
-
-        // Render Timeline
-        for (const [dateLabel, dayExpenses] of Object.entries(groupedExpenses)) {
-            // Date Header
-            list.innerHTML += `
-                <div class="sticky top-0 z-10 bg-gray-100/90 backdrop-blur pt-4 pb-2 mt-2">
-                    <h3 class="text-xs font-bold text-indigo-800 uppercase tracking-wider">${dateLabel}</h3>
-                </div>
-            `;
-
-            // Expenses for that day
-            dayExpenses.forEach(exp => {
-                let attachmentsHtml = '';
-                if (exp.attachments && exp.attachments.length > 0) {
-                    attachmentsHtml = `<div class="mt-3 flex flex-col gap-2 pt-2 border-t border-gray-100">`;
-                    exp.attachments.forEach((att) => {
-                        const isImage = att.type.startsWith('image/');
-                        if (isImage) {
-                            attachmentsHtml += `
-                            <div class="flex items-center justify-between bg-gray-50 p-2 rounded border border-gray-200">
-                                <div class="flex items-center gap-2 cursor-pointer" onclick="openImageViewer('${att.data}', '${att.name}')">
-                                    <img src="${att.data}" class="h-8 w-8 object-cover rounded shadow-sm">
-                                    <span class="text-xs text-blue-600 truncate w-32">${att.name}</span>
-                                </div>
-                                <button onclick="downloadFile('${att.data}', '${att.name}')" class="text-xs bg-white border border-gray-300 px-2 py-1 rounded shadow-sm hover:bg-gray-100 flex items-center gap-1">
-                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg> Save
-                                </button>
-                            </div>`;
-                        } else {
-                            attachmentsHtml += `
-                            <div class="flex items-center justify-between bg-gray-50 p-2 rounded border border-gray-200">
-                                <div class="flex items-center gap-2">
-                                    <div class="w-8 h-8 bg-red-100 text-red-600 rounded flex items-center justify-center"><svg class="w-5 h-5" fill="currentColor" viewBox="0 0 20 20"><path fill-rule="evenodd" d="M4 4a2 2 0 012-2h4.586A2 2 0 0112 2.586L15.414 6A2 2 0 0116 7.414V16a2 2 0 01-2 2H6a2 2 0 01-2-2V4zm2 6a1 1 0 011-1h6a1 1 0 110 2H7a1 1 0 100-2H7z" clip-rule="evenodd"></path></svg></div>
-                                    <span class="text-xs text-gray-700 truncate w-32">${att.name}</span>
-                                </div>
-                                <button onclick="downloadFile('${att.data}', '${att.name}')" class="text-xs bg-white border border-gray-300 px-2 py-1 rounded shadow-sm hover:bg-gray-100 flex items-center gap-1">
-                                    <svg class="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4"></path></svg> Save
-                                </button>
-                            </div>`;
-                        }
-                    });
-                    attachmentsHtml += `</div>`;
-                }
-
-                let splitCheckboxesHtml = '';
-                if (state.participants && state.participants.length > 0) {
-                    splitCheckboxesHtml = `
-                        <div class="mt-3 pt-3 border-t border-gray-100 bg-gray-50/80 p-2.5 rounded-lg">
-                            <div class="flex justify-between items-center mb-2">
-                                <span class="text-xs font-bold text-gray-700 uppercase tracking-wider flex items-center gap-1">
-                                    <svg class="w-3.5 h-3.5 text-indigo-600" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path></svg>
-                                    Split Among:
-                                </span>
-                                <div class="space-x-1 text-[11px]">
-                                    <button type="button" onclick="selectAllTimelineExpenseParticipants(${exp.id}, true)" class="text-indigo-600 font-semibold hover:underline">Select All</button>
-                                    <span class="text-gray-300">|</span>
-                                    <button type="button" onclick="selectAllTimelineExpenseParticipants(${exp.id}, false)" class="text-indigo-600 font-semibold hover:underline">Clear</button>
-                                </div>
-                            </div>
-                            <div class="flex flex-wrap gap-1.5">
-                    `;
-
-                    state.participants.forEach(p => {
-                        const isChecked = exp.splits && exp.splits[p] !== undefined && exp.splits[p] > 0;
-                        const shareVal = isChecked ? exp.splits[p] : 0;
-                        
-                        splitCheckboxesHtml += `
-                            <label class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium cursor-pointer transition-all select-none ${isChecked ? 'bg-indigo-50 border-indigo-200 text-indigo-900 shadow-sm font-semibold' : 'bg-white border-gray-200 text-gray-500 hover:bg-gray-100'}">
-                                <input type="checkbox" ${isChecked ? 'checked' : ''} onchange="toggleTimelineParticipantSplit(${exp.id}, '${p}', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300 focus:ring-indigo-500 cursor-pointer">
-                                <span>${p}${p === state.userName ? ' (You)' : ''}</span>
-                                ${isChecked ? `<span class="text-[11px] text-indigo-600 font-bold ml-0.5">${formatMoney(shareVal)}</span>` : ''}
-                            </label>
-                        `;
-                    });
-
-                    splitCheckboxesHtml += `
-                            </div>
-                        </div>
-                    `;
-                }
-
-                const isSettled = !!exp.settled;
-
-                list.innerHTML += `
-                    <div class="bg-white p-4 rounded-xl border border-gray-200 shadow-sm relative ${isSettled ? 'opacity-70' : ''}">
-                        <div class="absolute top-4 right-4 flex gap-2">
-                            <button onclick="toggleSettled(${exp.id})" class="${isSettled ? 'text-emerald-500' : 'text-gray-300 hover:text-emerald-500'} transition-colors" title="${isSettled ? 'Mark Unsettled' : 'Mark Settled'}">
-                                <svg class="w-6 h-6" fill="${isSettled ? 'currentColor' : 'none'}" stroke="currentColor" viewBox="0 0 24 24">
-                                    ${isSettled 
-                                        ? '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>' 
-                                        : '<path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z"></path>'
-                                    }
-                                </svg>
-                            </button>
-                            <button onclick="editExpense(${exp.id})" class="text-gray-400 hover:text-indigo-600 transition-colors" title="Edit">
-                                <svg class="w-5 h-5 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z"></path></svg>
-                            </button>
-                            <button onclick="deleteExpenseDB(${exp.id})" class="text-gray-400 hover:text-red-500 transition-colors" title="Delete">
-                                <svg class="w-5 h-5 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg>
-                            </button>
-                        </div>
-                        <div class="flex justify-between items-start pr-24">
-                            <div class="w-full">
-                                <h4 class="font-bold text-gray-800 text-lg ${isSettled ? 'line-through decoration-2 decoration-gray-300' : ''}">
-                                    ${exp.description}
-                                    ${isSettled ? '<span class="bg-emerald-100 text-emerald-700 text-[10px] px-2 py-0.5 rounded-full ml-2 align-middle uppercase tracking-wider font-semibold no-underline inline-block">Settled</span>' : ''}
-                                </h4>
-                                <p class="text-xs text-gray-500 mb-2 mt-1"><span class="bg-gray-100 px-2 py-0.5 rounded text-gray-600">${exp.category}</span></p>
-                                <p class="text-sm text-gray-600"><span class="font-medium">${exp.paidBy === state.userName ? 'You' : exp.paidBy}</span> paid <span class="font-semibold text-indigo-600">${formatMoney(exp.amount)}</span></p>
-                                ${attachmentsHtml}
-                                ${splitCheckboxesHtml}
-                            </div>
-                        </div>
-                    </div>
-                `;
-            });
+          }
         }
+      }
+    }
+  });
+}
+
+function renderPeopleChart(data) {
+  const canvas = $('peopleChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const ctx = canvas.getContext('2d');
+
+  const totals = {};
+  data.forEach(function (it) {
+    Object.keys(it.splits || {}).forEach(function (person) {
+      totals[person] = (totals[person] || 0) + (Number(it.splits[person]) || 0);
+    });
+  });
+
+  const labels = Object.keys(totals);
+  const values = Object.values(totals);
+  const palette = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#64748b'];
+
+  if (chartInstances.people) chartInstances.people.destroy();
+  if (!labels.length) {
+    chartInstances.people = new Chart(ctx, {
+      type: 'pie',
+      data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } }
+    });
+    return;
+  }
+
+  chartInstances.people = new Chart(ctx, {
+    type: 'pie',
+    data: {
+      labels: labels.map(function (l) { return l === state.userName ? 'You' : l; }),
+      datasets: [{ data: values, backgroundColor: palette.slice(0, labels.length), borderWidth: 1 }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: function (context) { return ' ' + money(context.raw); } } }
+      }
+    }
+  });
+}
+
+function renderCategoryChart(data) {
+  const canvas = $('categoryChart');
+  if (!canvas || typeof Chart === 'undefined') return;
+  const ctx = canvas.getContext('2d');
+
+  const totals = {};
+  data.forEach(function (it) {
+    totals[it.category] = (totals[it.category] || 0) + (Number(it.amount) || 0);
+  });
+
+  const labels = Object.keys(totals);
+  const values = Object.values(totals);
+  const palette = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899'];
+
+  if (chartInstances.category) chartInstances.category.destroy();
+  if (!labels.length) {
+    chartInstances.category = new Chart(ctx, {
+      type: 'doughnut',
+      data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] },
+      options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } }
+    });
+    return;
+  }
+
+  chartInstances.category = new Chart(ctx, {
+    type: 'doughnut',
+    data: {
+      labels: labels,
+      datasets: [{ data: values, backgroundColor: palette.slice(0, labels.length), borderWidth: 1 }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: {
+        legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } },
+        tooltip: { callbacks: { label: function (context) { return ' ' + money(context.raw); } } }
+      }
+    }
+  });
+}
+
+/* ---------------------------- settings --------------------------- */
+
+async function saveUserName() {
+  const input = $('setting-user-name');
+  const newName = (input.value || '').trim();
+  if (!newName) return alert('Name cannot be empty.');
+  const oldName = state.userName;
+  if (newName === oldName) return;
+
+  const taken = state.participants.some(function (p) {
+    return p !== oldName && samePerson(p, newName);
+  });
+  if (taken) return alert('That name is already a participant.');
+
+  const idx = state.participants.indexOf(oldName);
+  if (idx !== -1) state.participants[idx] = newName;
+  else if (!state.participants.some(function (p) { return samePerson(p, newName); })) state.participants.unshift(newName);
+
+  for (const project of projects) {
+    if (project.payer === oldName) {
+      project.payer = newName;
+      await dbPut(STORE_PROJECTS, project);
+    }
+  }
+
+  for (const item of items) {
+    let changed = false;
+    if (item.paidBy === oldName) { item.paidBy = newName; changed = true; }
+    if (item.splits && item.splits[oldName] !== undefined) {
+      const amount = item.splits[oldName];
+      delete item.splits[oldName];
+      item.splits[newName] = amount;
+      changed = true;
+    }
+    if (changed) await dbPut(STORE_ITEMS, item);
+  }
+
+  state.userName = newName;
+  await saveMeta();
+  updateAllViews();
+  alert('Name updated.');
+}
+
+async function saveCurrency() {
+  const input = $('setting-currency');
+  const next = (input.value || '').trim();
+  if (!next) return alert('Enter a currency symbol.');
+  state.currency = next;
+  await saveMeta();
+  updateAllViews();
+  alert('Currency updated.');
+}
+
+function csvCell(value) {
+  const s = String(value === undefined || value === null ? '' : value);
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function exportToCSV() {
+  if (!items.length) return alert('No bills to export yet.');
+
+  const header = ['Bill', 'Date', 'Item', 'Category', 'Amount', 'Paid By', 'Settled']
+    .concat(state.participants.map(function (p) { return p + ' Share'; }));
+
+  const rows = [header.map(csvCell).join(',')];
+  const sorted = items.slice().sort(function (a, b) { return new Date(a.date) - new Date(b.date); });
+  sorted.forEach(function (item) {
+    const project = projectById(item.projectId);
+    const row = [
+      project ? project.name : '',
+      toDateOnly(item.date),
+      item.description,
+      item.category,
+      (Number(item.amount) || 0).toFixed(2),
+      item.paidBy,
+      item.settled ? 'Yes' : 'No'
+    ].concat(state.participants.map(function (p) {
+      return ((item.splits && Number(item.splits[p])) || 0).toFixed(2);
+    }));
+    rows.push(row.map(csvCell).join(','));
+  });
+
+  downloadText(rows.join('\n'), 'SplitTrack_' + todayStr() + '.csv');
+}
+
+function exportFullBackup() {
+  if (!projects.length) return alert('There is nothing to back up yet.');
+  const backup = {
+    appName: 'SplitTrack_Backup',
+    version: 3,
+    exportedAt: new Date().toISOString(),
+    meta: {
+      userName: state.userName,
+      currency: state.currency,
+      participants: state.participants
+    },
+    projects: projects,
+    items: items
+  };
+  downloadText(JSON.stringify(backup), 'SplitTrack_Backup_' + todayStr() + '.json', 'application/json');
+}
+
+async function clearAllData() {
+  if (!confirm('Erase every bill, item and attachment? This cannot be undone.')) return;
+  await dbClearEverything();
+  projects = [];
+  items = [];
+  expandedProjectIds = new Set();
+  state.participants = [state.userName];
+  await saveMeta();
+  updateAllViews();
+  alert('All data erased.');
+}
+
+async function importData(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  if (!file) return;
+
+  let text = '';
+  try {
+    text = await file.text();
+  } catch (err) {
+    alert('Could not read the file.');
+    return;
+  }
+  input.value = '';
+
+  const trimmed = text.trim();
+  const looksJson = /\.json$/i.test(file.name) || trimmed.charAt(0) === '{' || trimmed.charAt(0) === '[';
+  if (!looksJson) {
+    openImportModal(text);
+    return;
+  }
+
+  let data = null;
+  try { data = JSON.parse(text); } catch (err) { data = null; }
+  if (!data) return alert('That file is not valid JSON.');
+  if (!Array.isArray(data.projects) || !Array.isArray(data.items)) {
+    return alert('That backup was made by an older version and is not supported. Send it over and it can be ported.');
+  }
+
+  if (!confirm('Replace everything with this backup? Current bills will be erased.')) return;
+
+  try {
+    await dbClearEverything();
+    projects = data.projects.slice();
+    items = data.items.slice();
+
+    if (data.meta) {
+      if (data.meta.userName) state.userName = data.meta.userName;
+      if (data.meta.currency) state.currency = data.meta.currency;
+      if (Array.isArray(data.meta.participants) && data.meta.participants.length) {
+        state.participants = data.meta.participants.slice();
+      }
+    }
+    if (!state.participants.some(function (p) { return samePerson(p, state.userName); })) {
+      state.participants.unshift(state.userName);
     }
 
-    async function toggleTimelineParticipantSplit(expId, participantName, isChecked) {
-        const exp = expenses.find(e => e.id === expId);
-        if (!exp) return;
+    for (const project of projects) await dbPut(STORE_PROJECTS, project);
+    for (const item of items) await dbPut(STORE_ITEMS, item);
+    await saveMeta();
 
-        if (!exp.splits) exp.splits = {};
+    expandedProjectIds = new Set();
+    switchView('history');
+    updateAllViews();
+    alert('Restored ' + projects.length + ' bill(s) and ' + items.length + ' item(s).');
+  } catch (err) {
+    alert('Restore failed: ' + err.message);
+  }
+}
 
-        const currentlyChecked = state.participants.filter(p => {
-            if (p === participantName) return isChecked;
-            return exp.splits[p] !== undefined && exp.splits[p] > 0;
-        });
+/* ------------------------- AI bill importer ---------------------- */
 
-        if (currentlyChecked.length === 0) {
-            alert("At least one participant must be selected to split the bill.");
-            renderHistory();
-            return;
-        }
+function openImportModal(initialText) {
+  const modal = $('modal-csv-import');
+  if (!modal) return;
 
-        const newSplits = {};
-        const share = exp.amount / currentlyChecked.length;
-        currentlyChecked.forEach(p => {
-            newSplits[p] = share;
-        });
+  importBills = [];
+  importDefaultParticipants = state.participants.slice();
 
-        exp.splits = newSplits;
-        exp.splitMethod = 'equal';
+  const payer = $('modal-csv-payer');
+  if (payer) {
+    payer.innerHTML = payerOptionsHtml(state.participants.indexOf(state.userName) !== -1 ? state.userName : '');
+    payer.value = state.participants.indexOf(state.userName) !== -1 ? state.userName : '';
+  }
 
-        await dbSaveExpense(exp);
-        updateAllViews();
-    }
+  const textarea = $('csv-paste-input');
+  if (textarea && typeof initialText === 'string') textarea.value = initialText;
 
-    async function selectAllTimelineExpenseParticipants(expId, selectAll) {
-        const exp = expenses.find(e => e.id === expId);
-        if (!exp) return;
+  const promptBox = $('prompt-preview-box');
+  if (promptBox) promptBox.textContent = AI_BILL_PROMPT;
+  const toggle = $('btn-toggle-prompt');
+  if (toggle) toggle.textContent = 'Show';
+  if (promptBox) promptBox.classList.add('hide');
+  const fileInput = $('modal-csv-file');
+  if (fileInput) fileInput.value = '';
 
-        if (!selectAll) {
-            alert("At least one participant must be selected for the bill split.");
-            return;
-        }
+  renderImportDefaultChips();
+  modal.classList.remove('hide');
+  parseImportText();
+}
 
-        const newSplits = {};
-        const share = exp.amount / state.participants.length;
-        state.participants.forEach(p => {
-            newSplits[p] = share;
-        });
+function closeImportModal() {
+  const modal = $('modal-csv-import');
+  if (modal) modal.classList.add('hide');
+  importBills = [];
+  importDefaultParticipants = [];
+}
 
-        exp.splits = newSplits;
-        exp.splitMethod = 'equal';
+function copyAIBillPrompt() {
+  const copied = navigator.clipboard && navigator.clipboard.writeText
+    ? navigator.clipboard.writeText(AI_BILL_PROMPT)
+    : Promise.reject(new Error('clipboard unavailable'));
 
-        await dbSaveExpense(exp);
-        updateAllViews();
-    }
+  copied.then(function () {
+    const btn = $('btn-copy-prompt');
+    if (!btn) return;
+    const original = btn.innerHTML;
+    btn.textContent = 'Copied!';
+    setTimeout(function () { btn.innerHTML = original; }, 1600);
+  }).catch(function () {
+    alert('Could not copy. Select the prompt text in the box below.');
+  });
+}
 
-    async function toggleSettled(id) {
-        const exp = expenses.find(e => e.id === id);
-        if (exp) {
-            exp.settled = !exp.settled;
-            await dbSaveExpense(exp);
-            updateAllViews();
-        }
-    }
+function togglePromptPreview() {
+  const box = $('prompt-preview-box');
+  const btn = $('btn-toggle-prompt');
+  if (!box) return;
+  if (box.classList.contains('hide')) {
+    box.classList.remove('hide');
+    if (btn) btn.textContent = 'Hide';
+  } else {
+    box.classList.add('hide');
+    if (btn) btn.textContent = 'Show';
+  }
+}
 
-    async function deleteExpenseDB(id) {
-        if (confirm("Are you sure you want to delete this expense?")) {
-            await dbDeleteExpense(id);
-            expenses = expenses.filter(e => e.id !== id);
-            updateAllViews();
-        }
-    }
+function handleModalCSVFileUpload(event) {
+  const input = event.target;
+  const file = input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function (e) {
+    const textarea = $('csv-paste-input');
+    if (textarea) textarea.value = e.target.result;
+    input.value = '';
+    parseImportText();
+  };
+  reader.readAsText(file);
+}
 
-    // --- Analytics Transparency Toggle ---
-    function toggleTransparency() {
-        const box = document.getElementById('transparency-box');
-        const btn = document.getElementById('btn-transparency');
-        if (box.classList.contains('hide')) {
-            box.classList.remove('hide');
-            btn.innerText = "Hide Math";
-        } else {
-            box.classList.add('hide');
-            btn.innerText = "Show Math";
-        }
-    }
-
-    // --- Settings & Data Management ---
-    async function saveUserName() {
-        const newName = document.getElementById('setting-user-name').value.trim();
-        if (!newName) return alert("Name cannot be empty");
-        const oldName = state.userName;
-        if (newName !== oldName) {
-            if (state.participants.includes(newName)) return alert("Participant exists.");
-            const pIndex = state.participants.indexOf(oldName);
-            if (pIndex !== -1) state.participants[pIndex] = newName;
-            
-            for (let exp of expenses) {
-                let changed = false;
-                if (exp.paidBy === oldName) { exp.paidBy = newName; changed = true; }
-                if (exp.splits[oldName] !== undefined) { 
-                    exp.splits[newName] = exp.splits[oldName]; 
-                    delete exp.splits[oldName]; 
-                    changed = true; 
-                }
-                if (changed) await dbSaveExpense(exp);
-            }
-            state.userName = newName; 
-            await saveMetadataOnly(); 
-            updateAllViews(); 
-            alert("Name updated!");
-        }
-    }
-
-    async function saveCurrency() {
-        const newCurrency = document.getElementById('setting-currency').value.trim();
-        if (newCurrency) { state.currency = newCurrency; await saveMetadataOnly(); updateAllViews(); alert("Currency updated!"); }
-    }
-
-    async function clearAllData() {
-        if (confirm("Are you SURE you want to erase all data?")) {
-            await dbClearAll();
-            expenses = []; 
-            state.participants = [state.userName]; 
-            await saveMetadataOnly(); 
-            updateAllViews(); 
-            alert("Data cleared.");
-        }
-    }
-
-    function exportToCSV() {
-        if (expenses.length === 0) return alert("No data to export!");
-        // Added Settled Column
-        let csvContent = "Date,Description,Category,Total Amount,Paid By,Split Method,Settled,AttachmentsCount";
-        state.participants.forEach(p => { csvContent += `,"${p}'s Share"`; }); csvContent += "\n";
-        expenses.forEach(exp => {
-            const dateStr = new Date(exp.date).toLocaleDateString(); 
-            const desc = `"${exp.description.replace(/"/g, '""')}"`;
-            const attCount = exp.attachments ? exp.attachments.length : 0;
-            const settledStr = exp.settled ? "Yes" : "No";
-            let row = `${dateStr},${desc},${exp.category},${exp.amount},${exp.paidBy},${exp.splitMethod},${settledStr},${attCount}`;
-            state.participants.forEach(p => { row += `,${(exp.splits[p] || 0).toFixed(2)}`; }); csvContent += row + "\n";
-        });
-        downloadFile(URL.createObjectURL(new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })), `ExpenseTracker_Spreadsheet_${new Date().toISOString().split('T')[0]}.csv`);
-    }
-
-    async function exportFullBackup() {
-        if (expenses.length === 0) return alert("No data to export!");
-        const backupObj = {
-            appName: "SplitTrack_Backup",
-            version: 2,
-            meta: state,
-            expenses: expenses
+function parseImportText() {
+  const textarea = $('csv-paste-input');
+  const parsed = parseBillCSV(textarea ? textarea.value : '');
+  importBills = parsed.bills.map(function (bill) {
+    return {
+      name: (bill.name || '').trim() || ('Bill ' + bill.date),
+      date: bill.date,
+      items: bill.items.map(function (it) {
+        const names = it.splitWith.map(canonicalParticipant).filter(Boolean);
+        return {
+          description: it.description,
+          category: it.category,
+          amount: it.amount,
+          mode: names.length ? 'custom' : 'default',
+          people: names
         };
-        const blob = new Blob([JSON.stringify(backupObj)], { type: "application/json" });
-        downloadFile(URL.createObjectURL(blob), `ExpenseTracker_FullBackup_${new Date().toISOString().split('T')[0]}.json`);
+      })
+    };
+  });
+  renderImportPreview();
+}
+
+function effectiveImportPeople(item) {
+  return item.mode === 'default' ? importDefaultParticipants.slice() : item.people.slice();
+}
+
+function updateImportBillName(index, value) {
+  if (!importBills[index]) return;
+  importBills[index].name = value;
+}
+
+function toggleImportPerson(billIndex, itemIndex, personIndex, checked) {
+  const bill = importBills[billIndex];
+  const item = bill && bill.items[itemIndex];
+  const person = state.participants[personIndex];
+  if (!item || !person) return;
+
+  if (item.mode === 'default') {
+    item.people = importDefaultParticipants.slice();
+    item.mode = 'custom';
+  }
+  if (checked) {
+    if (!item.people.some(function (p) { return samePerson(p, person); })) item.people.push(person);
+  } else {
+    item.people = item.people.filter(function (p) { return !samePerson(p, person); });
+  }
+  renderImportPreview();
+}
+
+function setImportBillPeople(billIndex, on) {
+  const bill = importBills[billIndex];
+  if (!bill) return;
+  bill.items.forEach(function (item) {
+    item.mode = 'custom';
+    item.people = on ? state.participants.slice() : [];
+  });
+  renderImportPreview();
+}
+
+function renderImportDefaultChips() {
+  const box = $('import-default-people');
+  if (!box) return;
+  box.innerHTML = state.participants.map(function (person, idx) {
+    const on = importDefaultParticipants.some(function (p) { return samePerson(p, person); });
+    return '<label class="inline-flex items-center gap-1.5 px-2 py-1 rounded-md border text-xs font-medium cursor-pointer select-none ' +
+      (on ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-white border-gray-200 text-gray-500') + '">' +
+      '<input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleImportDefault(' + idx + ', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300">' +
+      '<span>' + esc(person === state.userName ? person + ' (You)' : person) + '</span></label>';
+  }).join('');
+}
+
+function toggleImportDefault(personIndex, checked) {
+  const person = state.participants[personIndex];
+  if (!person) return;
+  if (checked) {
+    if (!importDefaultParticipants.some(function (p) { return samePerson(p, person); })) {
+      importDefaultParticipants.push(person);
     }
+  } else {
+    importDefaultParticipants = importDefaultParticipants.filter(function (p) { return !samePerson(p, person); });
+  }
+  renderImportDefaultChips();
+  renderImportPreview();
+}
 
-    function parseCSVLine(text) {
-        let ret = [''], i = 0, p = '', s = true;
-        for (let l of text) { if ('"' === l) { if (s && l === p) ret[i] += l; s = !s; } else if (',' === l && s) l = ret[++i] = ''; else ret[i] += l; p = l; }
-        return ret.map(x => x.trim().replace(/^"|"$/g, '').replace(/""/g, '"'));
-    }
+function setImportDefaultPeople(on) {
+  importDefaultParticipants = on ? state.participants.slice() : [];
+  renderImportDefaultChips();
+  renderImportPreview();
+}
 
-    async function importData(event) {
-        const file = event.target.files[0]; if (!file) return;
-        const reader = new FileReader();
-        reader.onload = async function(e) {
-            const text = e.target.result;
-            
-            if (file.name.endsWith('.json')) {
-                try {
-                    const parsed = JSON.parse(text);
-                    if (parsed.appName === "SplitTrack_Backup" || parsed.expenses) {
-                        await dbClearAll();
-                        state = { ...state, ...parsed.meta };
-                        await saveMetadataOnly();
-                        expenses = [];
-                        let count = 0;
-                        for (let exp of parsed.expenses) {
-                            delete exp.subcategory; // scrub incoming data
-                            await dbSaveExpense(exp);
-                            expenses.push(exp);
-                            count++;
-                        }
-                        updateAllViews(); switchView('history'); 
-                        alert(`Successfully restored full backup with ${count} expenses and all attachments!`);
-                    } else throw new Error("Invalid backup file format");
-                } catch(err) { alert("Error reading backup: " + err.message); }
-            } 
-            else if (file.name.endsWith('.csv')) {
-                const lines = text.split(/\r?\n/).filter(line => line.trim() !== '');
-                if (lines.length < 2) return alert("Invalid CSV.");
-                try {
-                    const header = parseCSVLine(lines[0]); 
-                    if (header.length < 6) throw new Error("Missing columns");
-                    
-                    // Fallback to safely handle different CSV versions
-                    let attCountIdx = header.indexOf("AttachmentsCount");
-                    let settledIdx = header.indexOf("Settled");
-                    
-                    let partStartIndex = attCountIdx !== -1 ? attCountIdx + 1 : header.length; // fallback
-                    if (attCountIdx === -1 && header[3] === "Subcategory") partStartIndex = 7; 
-                    if (attCountIdx === -1 && header[3] !== "Subcategory") partStartIndex = 6;
+function renderImportPreview() {
+  const container = $('modal-csv-preview-container');
+  const totalsBox = $('import-person-totals');
+  const totalLabel = $('modal-csv-total');
+  const submit = $('btn-import-bill-submit');
+  if (!container) return;
 
-                    const importedParticipants = [];
-                    for (let i = partStartIndex; i < header.length; i++) { const match = header[i].match(/(.+)'s Share/); importedParticipants.push(match ? match[1] : header[i]); }
-                    importedParticipants.forEach(p => { if (!state.participants.includes(p)) state.participants.push(p); });
-                    
-                    let importedCount = 0;
-                    for (let i = 1; i < lines.length; i++) {
-                        const row = parseCSVLine(lines[i]); if (row.length < 6) continue;
-                        
-                        const cat = row[2]; if (!state.categories.includes(cat)) state.categories.push(cat);
-                        
-                        let hasSubcatColumn = header[3] === "Subcategory";
-                        let amountIdx = hasSubcatColumn ? 4 : 3;
-                        let paidByIdx = hasSubcatColumn ? 5 : 4;
-                        let splitIdx = hasSubcatColumn ? 6 : 5;
-                        
-                        let isSettled = settledIdx !== -1 && row[settledIdx].toLowerCase() === 'yes';
+  if (!importBills.length) {
+    container.innerHTML = '<p class="text-xs text-gray-400 p-4 text-center">Paste the CSV (or upload the file) to preview items.</p>';
+    if (totalsBox) totalsBox.innerHTML = '';
+    if (totalLabel) totalLabel.textContent = 'Total: ' + money(0);
+    if (submit) submit.disabled = true;
+    return;
+  }
 
-                        let splits = {}, amount = parseFloat(row[amountIdx]);
-                        for (let j = 0; j < importedParticipants.length; j++) {
-                            const colIdx = partStartIndex + j; if (colIdx < row.length) { const val = parseFloat(row[colIdx]); if (!isNaN(val) && val > 0) splits[importedParticipants[j]] = val; }
-                        }
-                        
-                        let expObj = { 
-                            id: Date.now() + i, 
-                            date: new Date(row[0]).toISOString(), 
-                            description: row[1], 
-                            category: cat, 
-                            amount: isNaN(amount) ? 0 : amount, 
-                            paidBy: row[paidByIdx], 
-                            splitMethod: row[splitIdx] || 'equal', 
-                            settled: isSettled,
-                            splits: splits, 
-                            attachments: [] 
-                        };
-                        await dbSaveExpense(expObj);
-                        expenses.push(expObj);
-                        importedCount++;
-                    }
-                    await saveMetadataOnly(); updateAllViews(); switchView('history'); alert(`Imported ${importedCount} expenses!`);
-                } catch (err) { 
-                    // Fallback: If CSV is an AI-extracted itemized bill format, route to AI Bill CSV import modal
-                    openCSVImportModal(text);
-                }
-            }
-            event.target.value = '';
-        }; 
-        reader.readAsText(file);
-    }
+  let itemCount = 0;
+  let grandTotal = 0;
+  const personTotals = {};
+  let html = '';
 
-    // --- AI Bill CSV Import Modal Logic ---
-    const AI_BILL_PROMPT = `Extract all line items from the provided bill/receipt into a plain CSV format.
-Use strictly these column headers: Date, Description, Category, Amount
+  importBills.forEach(function (bill, billIndex) {
+    html += '<div class="border border-gray-200 rounded-xl bg-white overflow-hidden mb-2">' +
+      '<div class="flex items-center gap-2 p-2.5 bg-gray-50 border-b border-gray-200">' +
+        '<input value="' + esc(bill.name) + '" oninput="updateImportBillName(' + billIndex + ', this.value)" ' +
+          'class="flex-1 min-w-0 bg-transparent border-b border-transparent focus:border-indigo-400 outline-none text-sm font-bold text-gray-800">' +
+        '<span class="text-[10px] text-gray-400 whitespace-nowrap">' + esc(bill.date) + '</span>' +
+        '<div class="flex gap-1 text-[10px] whitespace-nowrap">' +
+          '<button type="button" onclick="setImportBillPeople(' + billIndex + ', true)" class="text-indigo-600 font-semibold hover:underline">All</button>' +
+          '<span class="text-gray-300">|</span>' +
+          '<button type="button" onclick="setImportBillPeople(' + billIndex + ', false)" class="text-indigo-600 font-semibold hover:underline">None</button>' +
+        '</div>' +
+      '</div>' +
+      '<div class="divide-y divide-gray-100">';
 
-Rules:
-1. Date should be in YYYY-MM-DD format (use today's date if not specified on the bill).
-2. Description should be the clean item name (e.g. "Chicken Burger", "Margherita Pizza").
-3. Category should be "Food" (or "Travel", "Stay", "Entertainment", "Other" if applicable).
-4. Amount should be a numeric decimal value without currency symbols (e.g. 15.50).
-5. Do not include subtotal or total rows. Include only individual food/item lines.
-6. Output ONLY the raw CSV block inside a code fence.`;
+    bill.items.forEach(function (item, itemIndex) {
+      const people = effectiveImportPeople(item);
+      const share = people.length ? item.amount / people.length : 0;
+      itemCount += 1;
+      grandTotal += item.amount;
+      people.forEach(function (person) {
+        personTotals[person] = (personTotals[person] || 0) + share;
+      });
 
-    let parsedModalItems = [];
+      const extraPeople = people.filter(function (person) {
+        return !state.participants.some(function (p) { return samePerson(p, person); });
+      });
 
-    function openCSVImportModal(initialText = '') {
-        const modal = document.getElementById('modal-csv-import');
-        if (!modal) return;
+      const chips = state.participants.map(function (person, personIndex) {
+        const on = people.some(function (p) { return samePerson(p, person); });
+        return '<label class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] font-medium cursor-pointer select-none ' +
+          (on ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-white border-gray-200 text-gray-400') + '">' +
+          '<input type="checkbox" ' + (on ? 'checked' : '') +
+            ' onchange="toggleImportPerson(' + billIndex + ', ' + itemIndex + ', ' + personIndex + ', this.checked)" ' +
+            'class="w-3 h-3 text-indigo-600 rounded border-gray-300">' +
+          '<span>' + esc(person === state.userName ? 'You' : person) + '</span>' +
+          (on ? '<b>' + money(share) + '</b>' : '') +
+        '</label>';
+      }).join('');
 
-        // Populate Payer dropdown
-        const payerSelect = document.getElementById('modal-csv-payer');
-        payerSelect.innerHTML = `<option value="" disabled selected>Select who paid this bill</option>` +
-            state.participants.map(p => `<option value="${p}">${p} ${p === state.userName ? '(You)' : ''}</option>`).join('');
-
-        // Populate Participants checklist
-        const participantsContainer = document.getElementById('modal-csv-participants');
-        participantsContainer.innerHTML = state.participants.map(p => `
-            <label class="flex items-center justify-between p-1.5 rounded hover:bg-gray-50 cursor-pointer border border-gray-100">
-                <span class="text-xs font-medium text-gray-700">${p} ${p === state.userName ? '(You)' : ''}</span>
-                <input type="checkbox" checked value="${p}" class="modal-csv-part-check w-4 h-4 text-indigo-600 rounded">
-            </label>
-        `).join('');
-
-        // Set initial CSV input if provided
-        const inputArea = document.getElementById('csv-paste-input');
-        if (typeof initialText === 'string' && initialText.trim()) {
-            inputArea.value = initialText;
-        }
-
-        modal.classList.remove('hide');
-        previewCSVBill();
-    }
-
-    function closeCSVImportModal() {
-        const modal = document.getElementById('modal-csv-import');
-        if (modal) modal.classList.add('hide');
-    }
-
-    function copyAIBillPrompt() {
-        navigator.clipboard.writeText(AI_BILL_PROMPT).then(() => {
-            const btn = document.getElementById('btn-copy-prompt');
-            const origText = btn.innerHTML;
-            btn.innerHTML = `<svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> Copied!`;
-            btn.classList.replace('bg-indigo-600', 'bg-emerald-600');
-            setTimeout(() => {
-                btn.innerHTML = origText;
-                btn.classList.replace('bg-emerald-600', 'bg-indigo-600');
-            }, 2000);
-        }).catch(() => {
-            alert("Copy failed. Prompt text:\n\n" + AI_BILL_PROMPT);
-        });
-    }
-
-    function togglePromptPreview() {
-        const box = document.getElementById('prompt-preview-box');
-        const btn = document.getElementById('btn-toggle-prompt');
-        if (box.classList.contains('hide')) {
-            box.classList.remove('hide');
-            btn.innerText = "Hide";
-        } else {
-            box.classList.add('hide');
-            btn.innerText = "Show";
-        }
-    }
-
-    function selectAllCSVParticipants(select) {
-        document.querySelectorAll('.modal-csv-part-check').forEach(chk => {
-            chk.checked = select;
-        });
-    }
-
-    function handleModalCSVFileUpload(event) {
-        const file = event.target.files[0];
-        if (!file) return;
-        const reader = new FileReader();
-        reader.onload = function(e) {
-            document.getElementById('csv-paste-input').value = e.target.result;
-            previewCSVBill();
-        };
-        reader.readAsText(file);
-        event.target.value = '';
-    }
-
-    function parseAIBillCSV(text) {
-        if (!text || !text.trim()) return [];
-        
-        let cleaned = text.replace(/```[a-z]*\n?/gi, '').replace(/```/g, '').trim();
-        const lines = cleaned.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
-        if (lines.length === 0) return [];
-
-        let items = [];
-        let startIndex = 0;
-        
-        const header = parseCSVLine(lines[0]);
-        const isHeader = header.some(h => ['date', 'description', 'item', 'title', 'category', 'amount', 'cost', 'price'].includes(h.toLowerCase()));
-        if (isHeader) {
-            startIndex = 1;
-        }
-
-        const dateIdx = header.findIndex(h => h.toLowerCase().includes('date'));
-        const descIdx = header.findIndex(h => h.toLowerCase().includes('desc') || h.toLowerCase().includes('item') || h.toLowerCase().includes('title'));
-        const catIdx = header.findIndex(h => h.toLowerCase().includes('cat'));
-        const amtIdx = header.findIndex(h => h.toLowerCase().includes('amount') || h.toLowerCase().includes('cost') || h.toLowerCase().includes('price'));
-
-        const todayStr = new Date().toISOString().split('T')[0];
-
-        for (let i = startIndex; i < lines.length; i++) {
-            const cols = parseCSVLine(lines[i]);
-            if (cols.length < 2) continue;
-
-            let dateVal = todayStr;
-            let descVal = '';
-            let catVal = 'Food';
-            let amtVal = 0;
-
-            if (isHeader && amtIdx !== -1) {
-                if (dateIdx !== -1 && cols[dateIdx]) dateVal = cols[dateIdx];
-                if (descIdx !== -1 && cols[descIdx]) descVal = cols[descIdx];
-                if (catIdx !== -1 && cols[catIdx]) catVal = cols[catIdx];
-                if (cols[amtIdx]) amtVal = parseFloat(cols[amtIdx].replace(/[^0-9.]/g, '')) || 0;
-            } else {
-                if (cols.length >= 4) {
-                    dateVal = cols[0] || todayStr;
-                    descVal = cols[1] || 'Food Item';
-                    catVal = cols[2] || 'Food';
-                    amtVal = parseFloat(cols[3].replace(/[^0-9.]/g, '')) || 0;
-                } else if (cols.length === 3) {
-                    if (/^\d{4}-\d{2}-\d{2}$/.test(cols[0])) {
-                        dateVal = cols[0];
-                        descVal = cols[1];
-                        amtVal = parseFloat(cols[2].replace(/[^0-9.]/g, '')) || 0;
-                    } else {
-                        descVal = cols[0];
-                        catVal = cols[1];
-                        amtVal = parseFloat(cols[2].replace(/[^0-9.]/g, '')) || 0;
-                    }
-                } else if (cols.length === 2) {
-                    descVal = cols[0];
-                    amtVal = parseFloat(cols[1].replace(/[^0-9.]/g, '')) || 0;
-                }
-            }
-
-            if (isNaN(new Date(dateVal).getTime())) {
-                dateVal = todayStr;
-            } else {
-                dateVal = new Date(dateVal).toISOString().split('T')[0];
-            }
-
-            if (!descVal) descVal = 'Food Item';
-            if (!state.categories.includes(catVal)) {
-                catVal = 'Food';
-            }
-
-            if (amtVal > 0) {
-                items.push({
-                    date: dateVal,
-                    description: descVal,
-                    category: catVal,
-                    amount: amtVal
-                });
-            }
-        }
-        return items;
-    }
-
-    function previewCSVBill() {
-        const text = document.getElementById('csv-paste-input').value;
-        parsedModalItems = parseAIBillCSV(text);
-
-        const container = document.getElementById('modal-csv-preview-container');
-        const submitBtn = document.getElementById('btn-import-bill-submit');
-        const totalSpan = document.getElementById('modal-csv-total');
-
-        if (parsedModalItems.length === 0) {
-            container.innerHTML = `<p class="text-xs text-gray-400 p-4 text-center">Paste CSV content above or upload a file to preview items.</p>`;
-            submitBtn.disabled = true;
-            totalSpan.innerText = `Total: ${state.currency}0.00`;
-            return;
-        }
-
-        const totalAmount = parsedModalItems.reduce((sum, item) => sum + item.amount, 0);
-        totalSpan.innerText = `Total: ${state.currency}${totalAmount.toFixed(2)} (${parsedModalItems.length} items)`;
-        submitBtn.disabled = false;
-
-        let tableHtml = `
-            <table class="w-full text-xs text-left text-gray-600">
-                <thead class="bg-gray-100 text-gray-700 uppercase text-[10px] font-bold sticky top-0">
-                    <tr>
-                        <th class="p-2">Date</th>
-                        <th class="p-2">Item Description</th>
-                        <th class="p-2">Category</th>
-                        <th class="p-2 text-right">Amount</th>
-                    </tr>
-                </thead>
-                <tbody class="divide-y divide-gray-100 bg-white">
-        `;
-
-        parsedModalItems.forEach(item => {
-            tableHtml += `
-                <tr class="hover:bg-gray-50">
-                    <td class="p-2 font-mono text-gray-500">${item.date}</td>
-                    <td class="p-2 font-semibold text-gray-800">${item.description}</td>
-                    <td class="p-2"><span class="bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded text-[10px]">${item.category}</span></td>
-                    <td class="p-2 text-right font-mono font-bold text-indigo-600">${state.currency}${item.amount.toFixed(2)}</td>
-                </tr>
-            `;
-        });
-
-        tableHtml += `</tbody></table>`;
-        container.innerHTML = tableHtml;
-    }
-
-    async function executeCSVBillImport() {
-        const payerSelect = document.getElementById('modal-csv-payer');
-        const payer = payerSelect.value;
-        if (!payer) {
-            return alert("Please select who paid the bill.");
-        }
-
-        const checkedBoxes = Array.from(document.querySelectorAll('.modal-csv-part-check:checked')).map(c => c.value);
-        if (checkedBoxes.length === 0) {
-            return alert("Please tick at least one participant who shared this bill.");
-        }
-
-        if (parsedModalItems.length === 0) {
-            return alert("No valid items parsed from the CSV.");
-        }
-
-        try {
-            document.getElementById('btn-import-bill-submit').disabled = true;
-
-            let count = 0;
-            const splitShare = 1 / checkedBoxes.length;
-
-            for (let item of parsedModalItems) {
-                let splits = {};
-                checkedBoxes.forEach(p => {
-                    splits[p] = item.amount * splitShare;
-                });
-
-                let expObj = {
-                    id: Date.now() + count,
-                    date: new Date(item.date).toISOString(),
-                    description: item.description,
-                    category: item.category,
-                    amount: item.amount,
-                    paidBy: payer,
-                    splitMethod: 'equal',
-                    settled: false,
-                    splits: splits,
-                    attachments: []
-                };
-
-                await dbSaveExpense(expObj);
-                expenses.push(expObj);
-                count++;
-            }
-
-            await saveMetadataOnly();
-            updateAllViews();
-            closeCSVImportModal();
-            switchView('history');
-            alert(`Successfully imported ${count} bill items split among ${checkedBoxes.length} participant(s)!`);
-
-        } catch (err) {
-            alert("Error importing bill items: " + err.message);
-        } finally {
-            document.getElementById('btn-import-bill-submit').disabled = false;
-        }
-    }
-
-    // --- People & Analytics ---
-    function renderPeople() {
-        const list = document.getElementById('people-list'); list.innerHTML = '';
-        state.participants.forEach((person, index) => {
-            const isUser = person === state.userName;
-            list.innerHTML += `<li class="flex justify-between items-center p-3 hover:bg-gray-50"><span class="font-medium text-gray-700">${person} ${isUser ? '<span class="text-xs bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full ml-2">You</span>' : ''}</span><button onclick="removePerson(${index})" class="text-red-500 hover:text-red-700 p-1" ${isUser ? 'disabled style="opacity:0.2"' : ''}><svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16"></path></svg></button></li>`;
-        });
-    }
-
-    document.getElementById('add-person-form').addEventListener('submit', async (e) => {
-        e.preventDefault(); const name = document.getElementById('new-person-name').value.trim();
-        if (name && !state.participants.includes(name)) { state.participants.push(name); document.getElementById('new-person-name').value = ''; await saveMetadataOnly(); updateAllViews(); }
-        else if (state.participants.includes(name)) alert('Exists!');
+      html += '<div class="p-2.5">' +
+        '<div class="flex items-start justify-between gap-2">' +
+          '<div class="min-w-0">' +
+            '<p class="text-sm font-semibold text-gray-800 break-words">' + esc(item.description) + '</p>' +
+            '<p class="text-[10px] text-gray-500">' + esc(item.category) + '</p>' +
+          '</div>' +
+          '<p class="font-mono text-sm font-bold text-indigo-600 whitespace-nowrap">' + money(item.amount) + '</p>' +
+        '</div>' +
+        '<div class="flex flex-wrap gap-1 mt-1.5">' + chips + '</div>' +
+        (extraPeople.length
+          ? '<p class="text-[10px] text-amber-600 mt-1">Will add new participant(s): ' +
+            extraPeople.map(esc).join(', ') + '</p>'
+          : '') +
+        (people.length ? '' : '<p class="text-[10px] text-red-500 mt-1">Nobody selected - this item cannot import.</p>') +
+      '</div>';
     });
 
-    async function removePerson(index) {
-        const personName = state.participants[index]; if (personName === state.userName) return;
-        const isInvolved = expenses.some(exp => exp.paidBy === personName || exp.splits[personName]);
-        if (isInvolved) return alert('Cannot remove person. Erase their expenses first.');
-        state.participants.splice(index, 1); await saveMetadataOnly(); updateAllViews();
+    html += '</div></div>';
+  });
+
+  container.innerHTML = html;
+  if (totalLabel) totalLabel.textContent = 'Total: ' + money(grandTotal) + ' (' + itemCount + ' items)';
+  if (totalsBox) {
+    const entries = Object.keys(personTotals).filter(function (person) {
+      return state.participants.some(function (p) { return samePerson(p, person); });
+    });
+    totalsBox.innerHTML = entries.length
+      ? entries.map(function (person) {
+          return '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded bg-white border border-gray-200 text-[10px] text-gray-600">' +
+            esc(person === state.userName ? 'You' : person) +
+            ' <b class="text-gray-800">' + money(personTotals[person]) + '</b></span>';
+        }).join('')
+      : '<span class="text-[10px] text-gray-400">No shares yet.</span>';
+  }
+  if (submit) submit.disabled = importBills.length === 0;
+}
+
+async function executeImport() {
+  const payerEl = $('modal-csv-payer');
+  const payer = payerEl ? payerEl.value : '';
+  if (!payer) return alert('Select who paid this bill.');
+  if (!importBills.length) return alert('Nothing to import yet.');
+
+  for (const bill of importBills) {
+    if (!String(bill.name || '').trim()) return alert('Every bill needs a name.');
+    for (const item of bill.items) {
+      if (!effectiveImportPeople(item).length) {
+        return alert('Pick at least one person for "' + item.description + '".');
+      }
+    }
+  }
+
+  try {
+    const known = new Map();
+    state.participants.forEach(function (p) { known.set(p.toLowerCase(), p); });
+    const additions = [];
+    importBills.forEach(function (bill) {
+      bill.items.forEach(function (item) {
+        effectiveImportPeople(item).forEach(function (raw) {
+          const name = String(raw).trim();
+          if (!name) return;
+          const key = name.toLowerCase();
+          if (!known.has(key)) {
+            known.set(key, name);
+            additions.push(name);
+          }
+        });
+      });
+    });
+    additions.forEach(function (name) {
+      if (!state.participants.some(function (p) { return samePerson(p, name); })) {
+        state.participants.push(name);
+      }
+    });
+    if (additions.length) await saveMeta();
+
+    const newProjectIds = [];
+    let imported = 0;
+
+    for (const bill of importBills) {
+      const projectId = uid();
+      const categories = Array.from(new Set(bill.items.map(function (it) { return it.category; }).filter(Boolean)));
+      if (!categories.length) categories.push('Uncategorised');
+
+      const project = {
+        id: projectId,
+        name: String(bill.name).trim(),
+        date: isoFromDateOnly(bill.date),
+        payer: payer,
+        categories: categories,
+        attachments: [],
+        createdAt: Date.now()
+      };
+      await dbPut(STORE_PROJECTS, project);
+      projects.push(project);
+      newProjectIds.push(projectId);
+
+      for (let i = 0; i < bill.items.length; i += 1) {
+        const source = bill.items[i];
+        const people = effectiveImportPeople(source).map(function (raw) {
+          return known.get(String(raw).toLowerCase()) || String(raw);
+        });
+        const item = {
+          id: uid(),
+          projectId: projectId,
+          order: i,
+          date: project.date,
+          description: source.description,
+          category: source.category,
+          amount: source.amount,
+          paidBy: payer,
+          splitMethod: 'equal',
+          splits: equalSplits(source.amount, people),
+          settled: false,
+          attachments: []
+        };
+        await dbPut(STORE_ITEMS, item);
+        items.push(item);
+        imported += 1;
+      }
     }
 
-    function renderDashboard() {
-        // 1. Filter Data based on Dashboard Inputs
-        const filteredExpenses = applyFilters(expenses, 'dash');
+    newProjectIds.forEach(function (id) { expandedProjectIds.add(id); });
+    closeImportModal();
+    switchView('history');
+    updateAllViews();
+    alert('Imported ' + imported + ' item(s) across ' + newProjectIds.length + ' bill(s).');
+  } catch (err) {
+    alert('Import failed: ' + err.message);
+  }
+}
 
-        // Total and Share calculations (Include Settled)
-        const totalExp = filteredExpenses.reduce((sum, exp) => sum + exp.amount, 0); 
-        document.getElementById('dash-total').innerText = formatMoney(totalExp);
-        
-        const personalShare = filteredExpenses.reduce((sum, exp) => sum + (exp.splits[state.userName] || 0), 0); 
-        document.getElementById('dash-personal').innerText = formatMoney(personalShare);
-        
-        // 2. Balances calculations (EXCLUDE SETTLED)
-        const unsettledExpenses = filteredExpenses.filter(e => !e.settled);
-        const balances = {}; 
-        state.participants.forEach(p => { balances[p] = 0; });
-        
-        unsettledExpenses.forEach(exp => {
-            if (balances[exp.paidBy] !== undefined) balances[exp.paidBy] += exp.amount;
-            for (const [person, share] of Object.entries(exp.splits)) { 
-                if (balances[person] !== undefined) balances[person] -= share; 
-            }
-        });
+function toggleTransparency() {
+  const box = $('transparency-box');
+  const btn = $('btn-transparency');
+  if (!box) return;
+  if (box.classList.contains('hide')) {
+    box.classList.remove('hide');
+    if (btn) btn.textContent = 'Hide Math';
+  } else {
+    box.classList.add('hide');
+    if (btn) btn.textContent = 'Show Math';
+  }
+}
 
-        // Generate Transparency Box HTML
-        let transparencyHtml = '<div class="space-y-2"><div class="flex items-center gap-2 border-b border-gray-200 pb-2"><svg class="w-4 h-4 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 7h6m0 10v-3m-3 3h.01M9 17h.01M9 14h.01M12 14h.01M15 11h.01M12 11h.01M9 11h.01M7 21h10a2 2 0 002-2V5a2 2 0 00-2-2H7a2 2 0 00-2 2v14a2 2 0 002 2z"></path></svg><strong>Net Balance = Total Paid &minus; Total Share</strong></div>';
-        let hasUnsettledData = false;
-        
-        state.participants.forEach(p => {
-            const paid = unsettledExpenses.filter(e => e.paidBy === p).reduce((sum, e) => sum + e.amount, 0);
-            const share = unsettledExpenses.reduce((sum, e) => sum + (e.splits[p] || 0), 0);
-            const bal = paid - share;
-            
-            if (paid > 0 || share > 0) {
-                hasUnsettledData = true;
-                const balColor = bal > 0.01 ? 'text-emerald-600' : (bal < -0.01 ? 'text-red-500' : 'text-gray-500');
-                const balSign = bal > 0.01 ? '+' : '';
-                transparencyHtml += `
-                    <div class="flex justify-between items-center py-1 border-b border-gray-100 last:border-0">
-                        <span class="font-medium text-gray-700">${p}</span>
-                        <span class="text-gray-500 text-[11px] sm:text-xs">
-                            Paid ${formatMoney(paid)} &minus; Share ${formatMoney(share)} = 
-                            <span class="font-bold ${balColor} text-sm">${balSign}${formatMoney(bal)}</span>
-                        </span>
-                    </div>`;
-            }
-        });
-        if (!hasUnsettledData) transparencyHtml += '<p class="text-gray-500 italic py-1">No active unsettled expenses.</p>';
-        transparencyHtml += '</div>';
-        document.getElementById('transparency-box').innerHTML = transparencyHtml;
+/* ----------------------------- boot ------------------------------ */
 
-        // Simplification Algorithm
-        let debtors = [], creditors = [];
-        for (const [person, balance] of Object.entries(balances)) { 
-            if (balance < -0.01) debtors.push({ person, amount: Math.abs(balance) }); 
-            else if (balance > 0.01) creditors.push({ person, amount: balance }); 
-        }
-        debtors.sort((a, b) => b.amount - a.amount); 
-        creditors.sort((a, b) => b.amount - a.amount);
-        
-        const settlements = []; let i = 0, j = 0;
-        while (i < debtors.length && j < creditors.length) {
-            let debtor = debtors[i], creditor = creditors[j]; let amount = Math.min(debtor.amount, creditor.amount);
-            let dName = debtor.person === state.userName ? 'You' : debtor.person, cName = creditor.person === state.userName ? 'You' : creditor.person;
-            settlements.push(`${dName} owe${dName==='You'?'':'s'} ${cName} <span class="font-bold text-gray-800">${formatMoney(amount)}</span>`);
-            debtor.amount -= amount; creditor.amount -= amount;
-            if (debtor.amount < 0.01) i++; if (creditor.amount < 0.01) j++;
-        }
-        
-        const balanceList = document.getElementById('balances-list');
-        balanceList.innerHTML = settlements.length === 0 ? '<p class="text-emerald-600 text-sm font-medium flex items-center gap-1"><svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path></svg> All balances are settled up!</p>' : settlements.map(s => `<div class="flex items-center gap-2 border-l-4 border-orange-400 pl-3 py-1 bg-orange-50 rounded-r"><span class="text-orange-700">➜</span> <span>${s}</span></div>`).join('');
-        
-        // Charts use ALL filtered data (including settled)
-        renderDateChart(filteredExpenses);
-        renderPeopleChart(filteredExpenses);
-        renderCategoryChart(filteredExpenses);
-    }
-    
-    function renderDateChart(chartData) {
-        const ctx = document.getElementById('dateCategoryChart').getContext('2d');
-        
-        // 1. Group by Date and Category
-        const dateMap = {}; 
-        chartData.forEach(exp => {
-            const dateObj = new Date(exp.date);
-            const isoDate = dateObj.toISOString().split('T')[0];
-            
-            if (!dateMap[isoDate]) dateMap[isoDate] = {};
-            if (!dateMap[isoDate][exp.category]) dateMap[isoDate][exp.category] = 0;
-            dateMap[isoDate][exp.category] += exp.amount;
-        });
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    parseCSVLine: parseCSVLine,
+    parseBillCSV: parseBillCSV,
+    parseAmount: parseAmount,
+    splitNameList: splitNameList,
+    equalSplits: equalSplits,
+    toDateOnly: toDateOnly
+  };
+}
 
-        // 2. Sort dates chronologically for X-axis
-        const sortedDates = Object.keys(dateMap).sort();
-        const labels = sortedDates.map(d => {
-            const dateObj = new Date(d);
-            return dateObj.toLocaleDateString(undefined, { month: 'short', day: 'numeric' });
-        });
+if (typeof window !== 'undefined') {
+  window.onload = init;
+}
 
-        // 3. Create datasets for each category
-        const bgColors = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#64748b', '#14b8a6', '#f43f5e'];
-        const datasets = [];
-        
-        state.categories.forEach((cat, index) => {
-            const dataForCat = sortedDates.map(d => dateMap[d][cat] || 0);
-            // Only add the category dataset if it has data
-            if (dataForCat.some(val => val > 0)) {
-                datasets.push({
-                    label: cat,
-                    data: dataForCat,
-                    backgroundColor: bgColors[index % bgColors.length],
-                });
-            }
-        });
-
-        if (dateChartInstance) dateChartInstance.destroy();
-
-        if (labels.length === 0) {
-            dateChartInstance = new Chart(ctx, { 
-                type: 'bar', 
-                data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] }, 
-                options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } } 
-            }); 
-            return;
-        }
-
-        dateChartInstance = new Chart(ctx, {
-            type: 'bar',
-            data: { labels: labels, datasets: datasets },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                scales: {
-                    x: { stacked: true },
-                    y: { stacked: true }
-                },
-                plugins: {
-                    legend: { 
-                        position: 'top', 
-                        labels: { boxWidth: 12, font: { size: 11 } } 
-                    },
-                    tooltip: {
-                        mode: 'index', 
-                        intersect: false,
-                        callbacks: {
-                            label: function(context) {
-                                // Skip showing 0 values in the tooltip
-                                if (context.raw > 0) {
-                                    return ` ${context.dataset.label}: ${state.currency}${context.raw.toFixed(2)}`;
-                                }
-                                return undefined; 
-                            },
-                            footer: function(tooltipItems) {
-                                // Calculate total sum of the visible bars for the day
-                                let total = tooltipItems.reduce((sum, item) => sum + item.raw, 0);
-                                return `Total: ${state.currency}${total.toFixed(2)}`;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    function renderPeopleChart(chartData) {
-        const ctx = document.getElementById('peopleChart').getContext('2d'); 
-        const personTotals = {};
-        chartData.forEach(exp => { 
-            for (const [person, share] of Object.entries(exp.splits)) {
-                personTotals[person] = (personTotals[person] || 0) + share;
-            }
-        });
-        
-        const labels = Object.keys(personTotals); 
-        const data = Object.values(personTotals); 
-        const bgColors = ['#f59e0b', '#3b82f6', '#10b981', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899', '#64748b'];
-        
-        if (peopleChartInstance) peopleChartInstance.destroy();
-        if (labels.length === 0) { 
-            peopleChartInstance = new Chart(ctx, { type: 'pie', data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } } }); 
-            return; 
-        }
-        
-        peopleChartInstance = new Chart(ctx, { 
-            type: 'pie', 
-            data: { labels: labels.map(l => l === state.userName ? 'You' : l), datasets: [{ data: data, backgroundColor: bgColors.slice(0, labels.length), borderWidth: 1 }] }, 
-            options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { callbacks: { label: function(context) { return ` ${state.currency}${context.raw.toFixed(2)}`; } } } } } 
-        });
-    }
-
-    function renderCategoryChart(chartData) {
-        const ctx = document.getElementById('categoryChart').getContext('2d'); const catTotals = {};
-        chartData.forEach(exp => { catTotals[exp.category] = (catTotals[exp.category] || 0) + exp.amount; });
-        const labels = Object.keys(catTotals), data = Object.values(catTotals), bgColors = ['#4f46e5', '#10b981', '#f59e0b', '#ef4444', '#8b5cf6', '#06b6d4', '#ec4899'];
-        if (categoryChartInstance) categoryChartInstance.destroy();
-        if (labels.length === 0) { categoryChartInstance = new Chart(ctx, { type: 'doughnut', data: { labels: ['No Data'], datasets: [{ data: [1], backgroundColor: ['#e5e7eb'] }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { tooltip: { enabled: false }, legend: { display: false } } } }); return; }
-        categoryChartInstance = new Chart(ctx, { type: 'doughnut', data: { labels: labels, datasets: [{ data: data, backgroundColor: bgColors.slice(0, labels.length), borderWidth: 1 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'right', labels: { boxWidth: 12, font: { size: 11 } } }, tooltip: { callbacks: { label: function(context) { return ` ${state.currency}${context.raw.toFixed(2)}`; } } } } } });
-    }
-
-    window.onload = init;

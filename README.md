@@ -1,92 +1,92 @@
-# Expense Tracker & Bill Splitter
+# SplitTrack — Bills with item-level splits
 
-A lightweight, purely client-side web application designed to help you track personal expenses, split bills with friends, and manage shared group finances. Designed with a mobile-first approach, it feels like a native app right in your browser.
+A lightweight, browser-only expense tracker built around **bills**: each bill is a group of items, and every item can be split among a different set of people. Tick Ali and Sara on the pizzas, tick only Ali on the beer, and leave Sara out of it — all inside one bill.
 
-## 🌟 Key Features
+No backend. Everything is stored locally in IndexedDB.
 
-* **No Backend Required:** Runs entirely in your browser. Your data is 100% private and stored locally on your device using `IndexedDB`.
-* **Smart Bill Splitting:** Split expenses equally, by exact custom amounts, or by percentage.
-* **Detailed Analytics Dashboard:** 
-  * View your total expenses and your personal share.
-  * "Who owes whom" settlement algorithm to minimize the number of transactions needed to settle debts.
-  * Interactive charts (powered by Chart.js): Daily Expenses Stacked Bar Chart, Overall Category Doughnut Chart, and Participants Pie Chart.
-* **Advanced Filtering:** Powerful multi-filter system across both Analytics and Timeline views. Filter by:
-  * Text Search (Cash Title/Description)
-  * People Involved
-  * Who Paid
-  * Category
-  * Specific Month
-  * Exact Date
-* **Debt Settlement Tracking:** Mark individual expenses as "Settled" using the checkmark icon. Settled expenses are removed from the "Who owes whom" calculation but remain visible in your historical analytics.
-* **Math Transparency:** A "Show Math" button in the dashboard clearly explains exactly how each person's net balance was calculated (Total Paid - Total Share).
-* **Receipt Attachments:** Upload and attach images or PDFs to any expense. Files are securely stored offline within your browser's database.
-* **Data Portability:** 
-  * Export to CSV for viewing in Excel/Google Sheets.
-  * Download/Import full `.json` backups (includes all receipt attachments) to transfer your data between devices.
+## What is new in this version
 
-## 🚀 How to Use
+* **Bills are first-class.** The main page lists compact bill cards; tap one to expand it into its items, edit them, settle the bill or delete the whole thing.
+* **Every item is split separately.** Each item has its own people list. Unticked people are skipped for that item; the item amount is divided equally among the ticked people.
+* **Categories start empty.** There are no seeded Food/Travel/Stay defaults. Each bill owns its own categories, created fresh when you type one or when an imported CSV brings one in.
+* **New AI import format.** The prompt now asks for Date, Bill, Item, Category, Amount and an optional Split With column, and the preview lets you tick people item by item.
+* **Fresh storage.** This build uses a new database (SplitTrackDB). Data from the old ExpenseTrackerDB version is not migrated.
 
-Since this is a client-side only application, there is no server setup or installation required.
+## How to use it
 
-1. **Open the App:** Simply double-click the `index.html` file to open it in any modern web browser (Chrome, Safari, Firefox, Safari on iOS, etc.).
-2. **Add Participants:** Go to the "People" tab via the bottom navigation to add your friends or family members.
-3. **Add Expenses:** Tap the "+" (Add) button. 
-   * Enter a description, amount, and date.
-   * *Note: You must explicitly select a Category and the person Who Paid.*
-   * Choose how the bill should be split among the participants.
-4. **View Balances:** Head to the "Analytics" tab to see exactly who owes whom and explore your spending charts.
-5. **Settle Up:** When someone pays you back, find the original expense in the "Timeline" tab and click the checkmark icon to mark it as settled.
+1. **Add people** in the People tab. You are added automatically.
+2. **Add a bill** from the Add Bill tab: give it a name (for example "Spice Route dinner"), a date and the payer.
+3. **Add items** inside that bill. Each item gets a name, an amount, a category you type yourself, and its own row of people chips. Ticked people share that item equally; unticked people are skipped.
+4. **Review bills** in the Bills tab. Each card shows the total, the payer, the item count and everyone involved. Tap to expand and see each item with every person's exact share.
+5. **Settle up**: the check icon on an item marks just that item; "Settle all" marks the whole bill. Settled items are excluded from "who owes whom" but stay in the charts and history.
 
-## 🤖 AI Bill Extraction Prompt
+Every bill has one payer. Changing the payer in Edit bill updates every item in that bill.
 
-Easily split restaurant bills or itemized receipts using AI (ChatGPT, Gemini, Claude). Copy the prompt below, attach your bill photo or paste receipt text into any AI model, and paste/import the resulting CSV into the application:
+## AI bill import
 
-```text
-Extract all line items from the provided bill/receipt into a plain CSV format.
-Use strictly these column headers: Date, Description, Category, Amount
+Tap **Import AI Bill** on the Add Bill screen (or in Settings). Copy the prompt below into ChatGPT, Claude or Gemini along with a photo of the bill, then paste the CSV it returns (or upload the .csv file).
+
+~~~text
+Extract every line item from the bill/receipt shown and return a plain CSV.
+Use exactly these columns: Date, Bill, Item, Category, Amount, Split With
 
 Rules:
-1. Date should be in YYYY-MM-DD format (use today's date if not specified on the bill).
-2. Description should be the clean item name (e.g. "Chicken Burger", "Margherita Pizza").
-3. Category should be "Food" (or "Travel", "Stay", "Entertainment", "Other" if applicable).
-4. Amount should be a numeric decimal value without currency symbols (e.g. 15.50).
-5. Do not include subtotal or total rows. Include only individual food/item lines.
-6. Output ONLY the raw CSV block inside a code fence.
-```
+1. Date - bill date as YYYY-MM-DD (use today if the bill has no date).
+2. Bill - one short name for the whole bill, repeated on every row (e.g. "Spice Route dinner", "Trek 2026").
+3. Item - the clean item name, one row per billed line (e.g. "Paneer Tikka", "Parking").
+4. Category - a short label you choose for that item, 1-2 words (e.g. "Starters", "Drinks", "Travel"). No fixed list: name categories freshly and keep them consistent within the bill.
+5. Amount - numbers only: no currency symbols and no thousands separators (write 1234.50, not 1,234.50). Put tax, service charge, tip and delivery fee on their own rows so the bill total stays exact. Put discounts as negative rows. Never include subtotal or grand total rows.
+6. Split With - fill only if the bill itself says who had an item (e.g. "for Ali"); separate names with semicolons. Otherwise leave it empty - the app lets you tick people per item.
+7. Output only the CSV inside a code fence, no commentary.
+~~~
 
-**How to Import AI CSV:**
-1. Copy the prompt above and send it to your AI along with your receipt image.
-2. In Expense Tracker, click **Settings -> Import AI Bill CSV** (or click **Copy AI Prompt** directly inside the app modal).
-3. Paste the AI-generated CSV or upload the `.csv` file.
-4. Select **Who Paid** and tick the **Participants** who shared/ate the items.
-5. Click **Import All Expenses**.
+### What happens after you paste
 
-## 🛠️ Technologies Used
+* The CSV is grouped into **one card per bill** (name + date). A single paste can contain several bills.
+* Each item row gets its own chip list. The "Default: who shared?" chips seed every item that had no Split With; tapping a chip on a row only changes that row. Use All / None on a bill header to reset that bill's items.
+* Names in Split With that are not in People yet are listed as "Will add new participant(s)" and are created on import.
+* The share totals under the preview show what each person owes before you commit.
+* Tax, service charge, tip and delivery rows are imported as normal items, so the bill total matches the receipt. Discounts are imported as negative amounts.
 
-* **HTML5 / CSS3 / Vanilla JavaScript:** Keeping the app incredibly fast and lightweight.
-* **Tailwind CSS:** For rapid, responsive, and modern UI styling.
-* **Chart.js:** For rendering beautiful, interactive data visualizations.
-* **IndexedDB:** The browser's native database API used to store extensive structured data and file attachments persistently across sessions.
+## Data, backup and restore
 
-## 📁 File Structure
+* **Export to CSV** writes one row per item with the bill name, category, amount, payer and every person's share.
+* **Download Full Backup (.json)** writes a version 3 backup containing settings, bills, items, shares and attachments.
+* **Import Backup (.json) or CSV** restores a version 3 backup (replacing current data), or opens the AI importer when you pick a CSV.
+* Old backups from the previous Expense Tracker format are not imported automatically. Send one over and it can be ported.
+* **Erase All Data** clears the database and resets participants.
 
-The application is structured into modular files for clean maintenance and full offline availability:
+Storage lives in IndexedDB under SplitTrackDB. Clearing site data in the browser deletes everything, so keep JSON backups.
 
-```
+## Architecture
+
+* Pure client-side HTML/CSS/vanilla JS.
+* IndexedDB stores: metadata (settings), projects (bills), items (expense lines).
+* Tailwind is vendored for offline styling, Chart.js for the dashboard charts.
+* No build step, no server.
+
+## File structure
+
+~~~text
 Expense-Tracker/
-├── index.html          # Main HTML structure and UI layout
-├── README.md           # Project documentation and user guide
-├── css/
-│   └── style.css       # Custom styling, scrollbars, and modal layout rules
+├── index.html          # Views, modals, navigation
+├── README.md
+├── css/style.css
 └── js/
-    ├── app.js          # Main application logic, IndexedDB handlers, and chart renders
+    ├── app.js          # State, IndexedDB, bills, splits, importer, charts
     └── vendor/
-        ├── chart.js    # Local Chart.js library for offline analytics charts
-        └── tailwind.js # Local Tailwind CSS runtime engine
-```
+        ├── chart.js
+        └── tailwind.js
+~~~
 
-## ⚠️ Important Note on Data Storage
+## Deploying
 
-If you clear your browser's history and website data (specifically "Cookies and other site data" or "Offline website data"), you will **permanently delete** your expenses. 
+The site is published from the main branch with GitHub Pages. Commit the changed files and push; GitHub Pages then serves the new build at the project URL. If the browser still shows the old version, do a hard refresh (or clear the site cache) so the updated app.js is loaded.
 
-To prevent data loss, frequently go to **Settings -> Download Full Backup (.json)** to save a copy of your data locally to your hard drive or cloud storage.
+## Known limits
+
+* Splits are equal shares among the people ticked on an item; weighted or custom per-person amounts are not part of this version.
+* One payer per bill, applied to all its items.
+* The AI importer has a single payer setting for the whole paste. When the bills in one paste were paid by different people, import them one at a time or edit each bill afterwards.
+* Negative amounts (discounts) are allowed and split like any other item.
+
