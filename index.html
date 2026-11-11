@@ -124,8 +124,9 @@
                             <input type="date" id="bill-date" required class="w-full border border-gray-300 rounded-lg p-2 text-sm focus:ring-2 focus:ring-indigo-500 outline-none">
                         </div>
                         <div>
-                            <label class="block text-[11px] text-gray-500 mb-1">Who paid?</label>
-                            <select id="bill-payer" required class="w-full border border-gray-300 rounded-lg p-2 text-sm outline-none bg-white"></select>
+                            <label class="block text-[11px] text-gray-500 mb-1">Who paid? <span class="text-red-500">*</span></label>
+                            <select id="bill-payer" required onchange="this.classList.toggle('payer-missing', !this.value)" class="payer-missing w-full border border-gray-300 rounded-lg p-2 text-sm outline-none bg-white"></select>
+                            <p class="text-[10px] text-gray-400 mt-1">No default - choose who paid.</p>
                         </div>
                     </div>
                     <div>
@@ -143,7 +144,7 @@
                     <div id="draft-items" class="space-y-3"></div>
                     <datalist id="draft-category-list"></datalist>
                     <p class="text-[11px] text-gray-400 mt-3 leading-relaxed">
-                        Categories start empty - type your own name per item. Ticked people split the item equally by default. Tax and discount rows automatically use bill-ratio on save. Tap any item afterwards to switch to weights, percentages, custom amounts or ratio.
+                        Categories start empty - type your own name per item. Ticked people split the item equally by default. Tax, discount, adjustment and round-off rows automatically use Bill ratio on save; pick Bill ratio for any other item too. After saving, switch any item to weights, percentages or custom amounts.
                     </p>
                 </div>
 
@@ -360,9 +361,9 @@
 
                 <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 bg-gray-50 p-3.5 rounded-xl border border-gray-200">
                     <div>
-                        <label class="block text-xs font-bold text-gray-700 mb-1">Step 2: Who paid?</label>
-                        <select id="modal-csv-payer" class="w-full border border-gray-300 rounded-lg p-2 text-sm outline-none bg-white"></select>
-                        <p class="text-[10px] text-gray-400 mt-1">Applies to every bill in this paste. Import separately if different people paid.</p>
+                        <label class="block text-xs font-bold text-gray-700 mb-1">Step 2: Who paid? <span class="text-red-500">*</span></label>
+                        <select id="modal-csv-payer" onchange="updateImportPayerState()" aria-required="true" class="payer-missing w-full border border-gray-300 rounded-lg p-2 text-sm outline-none bg-white"></select>
+                        <p id="import-payer-hint" class="text-[10px] text-amber-600 font-medium mt-1">Choose who paid before importing. This applies to every bill in this paste.</p>
                     </div>
                     <div>
                         <div class="flex justify-between items-center mb-1">

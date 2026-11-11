@@ -24,7 +24,7 @@ const AI_BILL_PROMPT = [
   '2. Bill - one short name for the whole bill, repeated on every row (e.g. "Spice Route dinner", "Trek 2026").',
   '3. Item - the clean item name, one row per billed line (e.g. "Paneer Tikka", "Parking").',
   '4. Category - a short label you choose for that item, 1-2 words (e.g. "Starters", "Drinks", "Travel"). No fixed list: name categories freshly and keep them consistent within the bill.',
-  '5. Amount - numbers only: no currency symbols and no thousands separators (write 1234.50, not 1,234.50). Put tax, service charge, tip and delivery fee on their own rows so the bill total stays exact. Put discounts as negative rows. Never include subtotal or grand total rows.',
+  '5. Amount - numbers only: no currency symbols and no thousands separators (write 1234.50, not 1,234.50). Put tax, service charge, tip, delivery fee, adjustments and round-off on their own rows so the bill total stays exact. Put discounts as negative rows. Never include subtotal or grand total rows.',
   '6. Split With - fill only if the bill itself says who had an item (e.g. "for Ali"); separate names with semicolons. If it also states per-person quantities, add weights (e.g. Ali:2;Sara:1); if it states per-person percentages, add a percent sign (e.g. Ali:60%;Sara:40%). Otherwise leave it empty - the app lets you tick people and pick equal, weights, percentages, custom amounts or bill-ratio per item.',
   '7. Output only the CSV inside a code fence, no commentary.'
 ].join('\n');
@@ -298,13 +298,15 @@ function detectItemKind(description, category) {
   }
   if (has('tax') || has('taxes') || has('gst') || has('vat') || has('cgst') || has('sgst') ||
       has('igst') || has('cess') || has('surcharge') || has('tip') || has('tips') ||
-      has('gratuity') || has('packaging') || has('rounding')) {
+      has('gratuity') || has('packaging') || has('rounding') || has('roundoff') ||
+      has('rounded') || has('adjustment') || has('adjustments')) {
     return 'tax';
   }
   if (hasPhrase('service charge') || hasPhrase('service fee') || hasPhrase('service tax') ||
       hasPhrase('delivery fee') || hasPhrase('delivery charge') || hasPhrase('platform fee') ||
       hasPhrase('convenience fee') || hasPhrase('booking fee') || hasPhrase('handling fee') ||
-      hasPhrase('packaging charge')) {
+      hasPhrase('packaging charge') || hasPhrase('round off') || hasPhrase('rounding off') ||
+      hasPhrase('bill adjustment') || hasPhrase('amount adjustment')) {
     return 'tax';
   }
   return 'item';
@@ -971,8 +973,11 @@ function resetAddForm() {
 
   const payerSelect = $('bill-payer');
   if (payerSelect) {
+    // No payer is preselected: every bill must make the choice explicit so a
+    // forgotten payer never silently lands on the user's name.
     payerSelect.innerHTML = payerOptionsHtml('');
-    payerSelect.value = state.participants.indexOf(state.userName) !== -1 ? state.userName : '';
+    payerSelect.value = '';
+    payerSelect.classList.add('payer-missing');
   }
 
   const fileInput = $('bill-files');
@@ -1015,12 +1020,18 @@ function addDraftItemRow() {
       '<input type="text" list="draft-category-list" class="draft-category w-full border border-gray-300 rounded-lg p-2 text-sm outline-none focus:ring-2 focus:ring-indigo-500" placeholder="Category">' +
     '</div>' +
     '<div>' +
-      '<div class="flex items-center justify-between mb-1">' +
+      '<div class="flex items-center justify-between gap-2 mb-1">' +
         '<span class="text-[10px] font-bold uppercase tracking-wider text-gray-400">Split between</span>' +
-        '<div class="space-x-1 text-[10px]">' +
-          '<button type="button" onclick="setDraftRowPeople(this, true)" class="text-indigo-600 hover:underline font-semibold">All</button>' +
-          '<span class="text-gray-300">|</span>' +
-          '<button type="button" onclick="setDraftRowPeople(this, false)" class="text-indigo-600 hover:underline font-semibold">None</button>' +
+        '<div class="flex items-center gap-2">' +
+          '<select class="draft-method text-[10px] font-semibold border border-gray-300 rounded-md px-1.5 py-0.5 bg-white text-gray-600 outline-none" title="Split method">' +
+            '<option value="equal">Equal</option>' +
+            '<option value="proportional">Bill ratio</option>' +
+          '</select>' +
+          '<div class="space-x-1 text-[10px]">' +
+            '<button type="button" onclick="setDraftRowPeople(this, true)" class="text-indigo-600 hover:underline font-semibold">All</button>' +
+            '<span class="text-gray-300">|</span>' +
+            '<button type="button" onclick="setDraftRowPeople(this, false)" class="text-indigo-600 hover:underline font-semibold">None</button>' +
+          '</div>' +
         '</div>' +
       '</div>' +
       '<div class="flex flex-wrap gap-1.5">' + peopleChips + '</div>' +
@@ -1029,6 +1040,27 @@ function addDraftItemRow() {
   wrap.appendChild(row);
   const desc = row.querySelector('.draft-desc');
   if (desc) desc.focus();
+
+  const methodSelect = row.querySelector('.draft-method');
+  if (methodSelect) {
+    methodSelect.addEventListener('change', function () {
+      row.dataset.methodTouched = '1';
+    });
+  }
+  ['draft-desc', 'draft-category'].forEach(function (cls) {
+    const input = row.querySelector('.' + cls);
+    if (input) input.addEventListener('input', function () { syncDraftRowMethod(row); });
+  });
+}
+
+function syncDraftRowMethod(row) {
+  if (!row || row.dataset.methodTouched === '1') return;
+  const select = row.querySelector('.draft-method');
+  if (!select) return;
+  const desc = row.querySelector('.draft-desc');
+  const category = row.querySelector('.draft-category');
+  const kind = detectItemKind(desc ? desc.value : '', category ? category.value : '');
+  select.value = kind === 'item' ? 'equal' : 'proportional';
 }
 
 function removeDraftRow(button) {
@@ -1054,7 +1086,11 @@ async function saveBill(event) {
   const payer = $('bill-payer').value;
 
   if (!name) return alert('Give the bill a name.');
-  if (!payer) return alert('Select who paid this bill.');
+  if (!payer) {
+    const payerEl = $('bill-payer');
+    if (payerEl) payerEl.focus();
+    return alert('Choose who paid this bill.');
+  }
 
   const rows = Array.prototype.slice.call(document.querySelectorAll('#draft-items .draft-item'));
   if (!rows.length) return alert('Add at least one item.');
@@ -1067,11 +1103,18 @@ async function saveBill(event) {
     const people = Array.prototype.slice.call(row.querySelectorAll('.draft-person:checked')).map(function (chk) {
       return state.participants[Number(chk.dataset.idx)];
     });
+    const methodSelect = row.querySelector('.draft-method');
+    const selectedMethod = methodSelect ? methodSelect.value : '';
+    const method = selectedMethod === 'proportional'
+      ? 'proportional'
+      : (selectedMethod === 'equal'
+        ? 'equal'
+        : (detectItemKind(desc, category) === 'item' ? 'equal' : 'proportional'));
 
     if (!desc) return alert('Every item needs a name.');
     if (!isFinite(amount) || amount === 0) return alert('Item "' + desc + '" needs a non-zero amount.');
-    if (!people.length) return alert('Tick at least one person for "' + desc + '".');
-    drafts.push({ description: desc, amount: amount, category: category, people: people });
+    if (method === 'equal' && !people.length) return alert('Tick at least one person for "' + desc + '".');
+    drafts.push({ description: desc, amount: amount, category: category, people: people, method: method });
   }
 
   try {
@@ -1091,8 +1134,6 @@ async function saveBill(event) {
 
     for (let i = 0; i < drafts.length; i += 1) {
       const draft = drafts[i];
-      const detected = detectItemKind(draft.description, draft.category);
-      const method = detected === 'item' ? 'equal' : 'proportional';
       const item = {
         id: uid(),
         projectId: projectId,
@@ -1102,9 +1143,9 @@ async function saveBill(event) {
         category: draft.category,
         amount: draft.amount,
         paidBy: payer,
-        splitMethod: method,
+        splitMethod: draft.method,
         splitInputs: {},
-        splits: equalSplits(draft.amount, draft.people),
+        splits: draft.method === 'equal' ? equalSplits(draft.amount, draft.people) : {},
         settled: false,
         attachments: []
       };
@@ -2228,12 +2269,17 @@ function openImportModal(initialText) {
 
   const payer = $('modal-csv-payer');
   if (payer) {
-    payer.innerHTML = payerOptionsHtml(state.participants.indexOf(state.userName) !== -1 ? state.userName : '');
-    payer.value = state.participants.indexOf(state.userName) !== -1 ? state.userName : '';
+    // Keep every participant in the list, but start with no payer selected.
+    payer.innerHTML = payerOptionsHtml('');
+    payer.value = '';
   }
 
+  updateImportPayerState();
+
   const textarea = $('csv-paste-input');
-  if (textarea && typeof initialText === 'string') textarea.value = initialText;
+  // Always start from a clean paste box. initialText is only used when a CSV
+  // file was picked from Settings, which still wants its contents loaded.
+  if (textarea) textarea.value = typeof initialText === 'string' ? initialText : '';
 
   const promptBox = $('prompt-preview-box');
   if (promptBox) promptBox.textContent = AI_BILL_PROMPT;
@@ -2253,6 +2299,36 @@ function closeImportModal() {
   if (modal) modal.classList.add('hide');
   importBills = [];
   importDefaultParticipants = [];
+}
+
+function importPayer() {
+  const payerEl = $('modal-csv-payer');
+  return payerEl ? payerEl.value : '';
+}
+
+function updateImportSubmitState() {
+  const submit = $('btn-import-bill-submit');
+  if (!submit) return;
+  submit.disabled = !importBills.length || !importPayer();
+}
+
+function updateImportPayerState() {
+  const payerEl = $('modal-csv-payer');
+  const hint = $('import-payer-hint');
+  const chosen = !!(payerEl && payerEl.value);
+
+  if (payerEl) {
+    payerEl.classList.toggle('payer-missing', !chosen);
+  }
+
+  if (hint) {
+    hint.textContent = chosen
+      ? 'Applies to every bill in this paste. Import separately if different people paid.'
+      : 'Choose who paid before importing. This applies to every bill in this paste.';
+    hint.className = 'text-[10px] mt-1 ' + (chosen ? 'text-gray-400' : 'text-amber-600 font-medium');
+  }
+
+  updateImportSubmitState();
 }
 
 function copyAIBillPrompt() {
@@ -2544,14 +2620,13 @@ function renderImportPreview() {
   const container = $('modal-csv-preview-container');
   const totalsBox = $('import-person-totals');
   const totalLabel = $('modal-csv-total');
-  const submit = $('btn-import-bill-submit');
   if (!container) return;
 
   if (!importBills.length) {
     container.innerHTML = '<p class="text-xs text-gray-400 p-4 text-center">Paste the CSV (or upload the file) to preview items.</p>';
     if (totalsBox) totalsBox.innerHTML = '';
     if (totalLabel) totalLabel.textContent = 'Total: ' + money(0);
-    if (submit) submit.disabled = true;
+    updateImportSubmitState();
     return;
   }
 
@@ -2574,14 +2649,22 @@ function renderImportPreview() {
     const results = sharesForImportItems(canonical);
 
     html += '<div class="border border-gray-200 rounded-xl bg-white overflow-hidden mb-2">' +
-      '<div class="flex items-center gap-2 p-2.5 bg-gray-50 border-b border-gray-200">' +
-        '<input value="' + esc(bill.name) + '" oninput="updateImportBillName(' + billIndex + ', this.value)" ' +
-          'class="flex-1 min-w-0 bg-transparent border-b border-transparent focus:border-indigo-400 outline-none text-sm font-bold text-gray-800">' +
-        '<span class="text-[10px] text-gray-400 whitespace-nowrap">' + esc(bill.date) + '</span>' +
-        '<div class="flex gap-1 text-[10px] whitespace-nowrap">' +
-          '<button type="button" onclick="setImportBillPeople(' + billIndex + ', true)" class="text-indigo-600 font-semibold hover:underline">All</button>' +
-          '<span class="text-gray-300">|</span>' +
-          '<button type="button" onclick="setImportBillPeople(' + billIndex + ', false)" class="text-indigo-600 font-semibold hover:underline">None</button>' +
+      '<div class="p-2.5 bg-gray-50 border-b border-gray-200 space-y-1.5">' +
+        '<div class="flex items-center justify-between gap-2">' +
+          '<span class="text-[10px] font-bold uppercase tracking-wider text-gray-500">Bill name</span>' +
+          '<div class="flex items-center gap-2 text-[10px] whitespace-nowrap">' +
+            '<span class="text-gray-400">' + esc(bill.date) + '</span>' +
+            '<div class="flex gap-1">' +
+              '<button type="button" onclick="setImportBillPeople(' + billIndex + ', true)" class="text-indigo-600 font-semibold hover:underline">All</button>' +
+              '<span class="text-gray-300">|</span>' +
+              '<button type="button" onclick="setImportBillPeople(' + billIndex + ', false)" class="text-indigo-600 font-semibold hover:underline">None</button>' +
+            '</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="relative">' +
+          '<input value="' + esc(bill.name) + '" oninput="updateImportBillName(' + billIndex + ', this.value)" placeholder="Bill name" aria-label="Bill name" title="Edit bill name" ' +
+            'class="w-full bg-white border border-gray-300 rounded-lg pl-2.5 pr-8 py-1.5 text-sm font-bold text-gray-800 outline-none focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500">' +
+          '<span class="absolute inset-y-0 right-2 flex items-center pointer-events-none text-gray-400">' + svgIcon(ICON.pencil, 'w-4 h-4') + '</span>' +
         '</div>' +
       '</div>' +
       '<div class="divide-y divide-gray-100">';
@@ -2699,17 +2782,22 @@ function renderImportPreview() {
         }).join('')
       : '<span class="text-[10px] text-gray-400">No shares yet.</span>';
   }
-  if (submit) submit.disabled = importBills.length === 0;
+  updateImportSubmitState();
 }
 
 async function executeImport() {
   const payerEl = $('modal-csv-payer');
   const payer = payerEl ? payerEl.value : '';
-  if (!payer) return alert('Select who paid this bill.');
+  if (!payer) {
+    if (payerEl) payerEl.focus();
+    updateImportPayerState();
+    return alert('Choose who paid before importing.');
+  }
   if (!importBills.length) return alert('Nothing to import yet.');
 
-  for (const bill of importBills) {
-    if (!String(bill.name || '').trim()) return alert('Every bill needs a name.');
+  for (let billIndex = 0; billIndex < importBills.length; billIndex += 1) {
+    const bill = importBills[billIndex];
+    if (!String(bill.name || '').trim()) return alert('Bill ' + (billIndex + 1) + ' needs a name.');
     for (const item of bill.items) {
       if (item.splitMethod !== 'proportional' && !effectiveImportPeople(item).length) {
         return alert('Pick at least one person for "' + item.description + '".');
