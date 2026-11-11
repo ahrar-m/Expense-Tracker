@@ -25,7 +25,7 @@ const AI_BILL_PROMPT = [
   '3. Item - the clean item name, one row per billed line (e.g. "Paneer Tikka", "Parking").',
   '4. Category - a short label you choose for that item, 1-2 words (e.g. "Starters", "Drinks", "Travel"). No fixed list: name categories freshly and keep them consistent within the bill.',
   '5. Amount - numbers only: no currency symbols and no thousands separators (write 1234.50, not 1,234.50). Put tax, service charge, tip and delivery fee on their own rows so the bill total stays exact. Put discounts as negative rows. Never include subtotal or grand total rows.',
-  '6. Split With - fill only if the bill itself says who had an item (e.g. "for Ali"); separate names with semicolons. Otherwise leave it empty - the app lets you tick people per item.',
+  '6. Split With - fill only if the bill itself says who had an item (e.g. "for Ali"); separate names with semicolons. If it also states per-person quantities, add weights (e.g. Ali:2;Sara:1); if it states per-person percentages, add a percent sign (e.g. Ali:60%;Sara:40%). Otherwise leave it empty - the app lets you tick people and pick equal, weights, percentages, custom amounts or bill-ratio per item.',
   '7. Output only the CSV inside a code fence, no commentary.'
 ].join('\n');
 
@@ -51,6 +51,9 @@ let dbPromise = null;
 let expandedProjectIds = new Set();
 let editingItem = null;
 let itemModalPeople = new Set();
+let itemModalMode = 'equal';
+let itemModalInputs = {};
+let itemModalCache = {};
 let editingBillId = null;
 let billModalAttachments = [];
 let stagedBillAttachments = [];
@@ -135,6 +138,214 @@ function equalSplits(amount, names) {
   unique.forEach(function (n) { out[n] = share; });
   return out;
 }
+
+
+const SPLIT_MODE_NAMES = ['equal', 'weighted', 'percent', 'custom', 'proportional'];
+const SPLIT_MODE_LABELS = ['Equal', 'Weights', '%', 'Custom', 'Ratio'];
+
+function splitModeName(index) {
+  return SPLIT_MODE_NAMES[index] || 'equal';
+}
+
+function splitModeIndex(name) {
+  const idx = SPLIT_MODE_NAMES.indexOf(name);
+  return idx === -1 ? 0 : idx;
+}
+
+function splitModeLabel(method) {
+  if (method === 'weighted') return 'weights';
+  if (method === 'percent') return '%';
+  if (method === 'custom') return 'custom';
+  if (method === 'proportional') return 'bill ratio';
+  return '';
+}
+
+function round2(value) {
+  return Math.round((Number(value) || 0) * 100) / 100;
+}
+
+function uniquePeople(people) {
+  const out = [];
+  (people || []).forEach(function (person) {
+    if (!person) return;
+    if (!out.some(function (existing) { return samePerson(existing, person); })) out.push(person);
+  });
+  return out;
+}
+
+function distributePercent(count) {
+  if (!count) return [];
+  const base = Math.floor((100 / count) * 100) / 100;
+  const values = new Array(count).fill(base);
+  const remainder = Math.round((100 - base * count) * 100);
+  for (let i = 0; i < Math.abs(remainder) && i < count; i += 1) {
+    values[i] = round2(values[i] + (remainder > 0 ? 0.01 : -0.01));
+  }
+  return values;
+}
+
+function distributeAmount(amount, count) {
+  if (!count) return [];
+  const cents = Math.round((Number(amount) || 0) * 100);
+  const base = Math.trunc(cents / count);
+  const remainder = cents - base * count;
+  const values = new Array(count).fill(base / 100);
+  for (let i = 0; i < Math.abs(remainder) && i < count; i += 1) {
+    values[i] = round2(values[i] + (remainder > 0 ? 0.01 : -0.01));
+  }
+  return values;
+}
+
+function seedSplitInputs(method, people, amount) {
+  const list = uniquePeople(people);
+  const out = {};
+  if (method === 'weighted') {
+    list.forEach(function (person) { out[person] = 1; });
+    return out;
+  }
+  if (method === 'percent') {
+    const values = distributePercent(list.length);
+    list.forEach(function (person, idx) { out[person] = values[idx]; });
+    return out;
+  }
+  if (method === 'custom') {
+    const values = distributeAmount(amount, list.length);
+    list.forEach(function (person, idx) { out[person] = values[idx]; });
+    return out;
+  }
+  return out;
+}
+
+function computeShares(amount, method, people, inputs) {
+  const list = uniquePeople(people);
+  const splits = {};
+  const total = Number(amount) || 0;
+
+  if (!list.length) return { splits: splits, error: 'Pick at least one person.' };
+
+  if (method === 'equal' || !method) {
+    return { splits: equalSplits(total, list), error: null };
+  }
+
+  if (method === 'weighted') {
+    let sum = 0;
+    const weights = {};
+    for (const person of list) {
+      const weight = Number(inputs[person]);
+      if (!isFinite(weight) || weight < 0) {
+        return { splits: splits, error: 'Weights must be zero or more.' };
+      }
+      weights[person] = weight;
+      sum += weight;
+    }
+    if (!(sum > 0)) return { splits: splits, error: 'Give at least one person a weight above zero.' };
+    list.forEach(function (person) { splits[person] = total * weights[person] / sum; });
+    return { splits: splits, error: null };
+  }
+
+  if (method === 'percent') {
+    let sum = 0;
+    const percents = {};
+    for (const person of list) {
+      const value = Number(inputs[person]);
+      if (!isFinite(value) || value < 0) {
+        return { splits: splits, error: 'Percentages must be zero or more.' };
+      }
+      percents[person] = value;
+      sum += value;
+    }
+    if (!sum || Math.abs(sum - 100) > 0.01) {
+      return { splits: splits, error: 'Percentages must add up to 100% (now ' + round2(sum) + '%).' };
+    }
+    list.forEach(function (person) { splits[person] = total * percents[person] / sum; });
+    return { splits: splits, error: null };
+  }
+
+  if (method === 'custom') {
+    let sum = 0;
+    const values = {};
+    for (const person of list) {
+      const value = Number(inputs[person]);
+      if (!isFinite(value)) return { splits: splits, error: 'Enter a number for every person.' };
+      values[person] = value;
+      sum += value;
+    }
+    if (Math.abs(sum - total) > 0.01) {
+      return { splits: splits, error: 'Amounts must add up to ' + money(total) + ' (now ' + money(sum) + ').' };
+    }
+    const last = list[list.length - 1];
+    values[last] = values[last] + (total - sum);
+    list.forEach(function (person) { splits[person] = values[person]; });
+    return { splits: splits, error: null };
+  }
+
+  return { splits: equalSplits(total, list), error: null };
+}
+
+function detectItemKind(description, category) {
+  const text = (' ' + String(description || '') + ' ' + String(category || '') + ' ')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  const words = text.split(' ').filter(Boolean);
+  function has(word) { return words.indexOf(word) !== -1; }
+  function hasPhrase(phrase) { return (' ' + text + ' ').indexOf(' ' + phrase + ' ') !== -1; }
+
+  if (has('discount') || has('discounts') || has('coupon') || has('promo') || has('promocode') ||
+      has('voucher') || has('cashback') || has('offer') || has('rebate') || has('complimentary')) {
+    return 'discount';
+  }
+  if (has('tax') || has('taxes') || has('gst') || has('vat') || has('cgst') || has('sgst') ||
+      has('igst') || has('cess') || has('surcharge') || has('tip') || has('tips') ||
+      has('gratuity') || has('packaging') || has('rounding')) {
+    return 'tax';
+  }
+  if (hasPhrase('service charge') || hasPhrase('service fee') || hasPhrase('service tax') ||
+      hasPhrase('delivery fee') || hasPhrase('delivery charge') || hasPhrase('platform fee') ||
+      hasPhrase('convenience fee') || hasPhrase('booking fee') || hasPhrase('handling fee') ||
+      hasPhrase('packaging charge')) {
+    return 'tax';
+  }
+  return 'item';
+}
+
+function parseSplitToken(token) {
+  const raw = String(token === undefined || token === null ? '' : token).trim();
+  if (!raw) return null;
+  let match = raw.match(/^(.*?)\s*:\s*(-?\d+(?:\.\d+)?)\s*%\s*$/);
+  if (match) return { name: match[1].trim(), value: Math.abs(Number(match[2])), kind: 'percent' };
+  match = raw.match(/^(.*?)\s*:\s*(-?\d+(?:\.\d+)?)\s*$/);
+  if (match) return { name: match[1].trim(), value: Math.abs(Number(match[2])), kind: 'weight' };
+  return { name: raw, value: null, kind: 'name' };
+}
+
+function proportionalSplitsForAmount(projectItems, amount) {
+  const totals = {};
+  let baseSum = 0;
+
+  (projectItems || []).forEach(function (item) {
+    if (!item || item.splitMethod === 'proportional') return;
+    const splits = item.splits || {};
+    Object.keys(splits).forEach(function (person) {
+      const value = Number(splits[person]) || 0;
+      totals[person] = (totals[person] || 0) + value;
+      baseSum += value;
+    });
+  });
+
+  if (Math.abs(baseSum) < 0.000001) {
+    return equalSplits(amount, state.participants);
+  }
+
+  const splits = {};
+  Object.keys(totals).forEach(function (person) {
+    const value = Number(amount) * totals[person] / baseSum;
+    if (Math.abs(value) > 0.0000001) splits[person] = value;
+  });
+  return splits;
+}
+
 
 function svgIcon(path, cls) {
   return '<svg class="' + (cls || 'w-4 h-4') + '" fill="none" stroke="currentColor" viewBox="0 0 24 24">' +
@@ -880,6 +1091,8 @@ async function saveBill(event) {
 
     for (let i = 0; i < drafts.length; i += 1) {
       const draft = drafts[i];
+      const detected = detectItemKind(draft.description, draft.category);
+      const method = detected === 'item' ? 'equal' : 'proportional';
       const item = {
         id: uid(),
         projectId: projectId,
@@ -889,7 +1102,8 @@ async function saveBill(event) {
         category: draft.category,
         amount: draft.amount,
         paidBy: payer,
-        splitMethod: 'equal',
+        splitMethod: method,
+        splitInputs: {},
         splits: equalSplits(draft.amount, draft.people),
         settled: false,
         attachments: []
@@ -898,6 +1112,7 @@ async function saveBill(event) {
       items.push(item);
     }
 
+    await recomputeBillProportional(projectId);
     expandedProjectIds.add(projectId);
     resetAddForm();
     switchView('history');
@@ -1001,7 +1216,28 @@ function openItemModal(projectId, itemId) {
   const splitKeys = item && item.splits ? Object.keys(item.splits) : [];
   itemModalPeople = new Set(splitKeys.length ? splitKeys : state.participants.slice());
 
-  renderItemModalChips();
+  const detected = item ? detectItemKind(item.description, item.category) : 'item';
+  itemModalMode = item && item.splitMethod
+    ? item.splitMethod
+    : (detected === 'item' ? 'equal' : 'proportional');
+
+  const amount = item ? Number(item.amount) || 0 : 0;
+  const people = Array.from(itemModalPeople);
+  itemModalCache = {};
+  if (item) {
+    if (item.splitInputs && Object.keys(item.splitInputs).length) {
+      itemModalCache[item.splitMethod] = Object.assign({}, item.splitInputs);
+    }
+    itemModalCache.weighted = deriveInputs('weighted', people, item.splits || {}, amount);
+    itemModalCache.percent = deriveInputs('percent', people, item.splits || {}, amount);
+    itemModalCache.custom = deriveInputs('custom', people, item.splits || {}, amount);
+  }
+  itemModalInputs = Object.assign(
+    {},
+    itemModalCache[itemModalMode] || seedSplitInputs(itemModalMode, itemModalPeople, amount)
+  );
+
+  renderItemSplitEditor();
   $('modal-item').classList.remove('hide');
 }
 
@@ -1010,38 +1246,194 @@ function closeItemModal() {
   if (modal) modal.classList.add('hide');
   editingItem = null;
   itemModalPeople = new Set();
+  itemModalInputs = {};
+  itemModalCache = {};
 }
 
-function renderItemModalChips() {
+function deriveInputs(method, people, shares, amount) {
+  const list = uniquePeople(people);
+  const out = {};
+  if (method === 'weighted') {
+    const values = list.map(function (p) { return Math.abs(Number(shares[p]) || 0); });
+    const allEqual = values.length > 0 && values.every(function (v) { return Math.abs(v - values[0]) < 0.0001; });
+    list.forEach(function (p, idx) { out[p] = allEqual ? 1 : round2(values[idx] || 1); });
+    return out;
+  }
+  if (method === 'percent') {
+    const absAmount = Math.abs(Number(amount) || 0);
+    list.forEach(function (p) {
+      out[p] = absAmount ? round2((Math.abs(Number(shares[p]) || 0) / absAmount) * 100) : 0;
+    });
+    return out;
+  }
+  if (method === 'custom') {
+    list.forEach(function (p) { out[p] = round2(Number(shares[p]) || 0); });
+    return out;
+  }
+  return out;
+}
+
+function pickInputs(inputs, people) {
+  const out = {};
+  uniquePeople(people).forEach(function (person) {
+    out[person] = Number(inputs[person]) || 0;
+  });
+  return out;
+}
+
+function renderItemSplitEditor() {
   const box = $('item-modal-people');
   if (!box || !editingItem) return;
 
   const amount = parseFloat($('item-modal-amount').value) || 0;
   const people = Array.from(itemModalPeople);
-  const share = people.length ? amount / people.length : 0;
 
-  box.innerHTML = state.participants.map(function (p, idx) {
-    const on = itemModalPeople.has(p);
-    return '<label class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-xs font-medium cursor-pointer select-none ' +
-      (on ? 'bg-indigo-50 border-indigo-300 text-indigo-900' : 'bg-white border-gray-200 text-gray-500') + '">' +
-      '<input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleItemPerson(' + idx + ', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300">' +
-      '<span>' + esc(p) + '</span>' +
-      (on ? '<span class="text-[10px] text-indigo-600 font-bold">' + money(share) + '</span>' : '') +
-    '</label>';
-  }).join('');
+  document.querySelectorAll('#item-split-modes button').forEach(function (btn) {
+    const active = Number(btn.dataset.mode) === splitModeIndex(itemModalMode);
+    btn.className = 'flex-1 px-1 py-1 rounded-md text-[10px] font-semibold transition-all ' +
+      (active ? 'bg-white shadow text-indigo-700' : 'text-gray-500 hover:bg-gray-200');
+  });
+
+  let result;
+  if (itemModalMode === 'proportional') {
+    result = {
+      splits: proportionalSplitsForAmount(
+        itemsOfProject(editingItem.projectId).filter(function (i) { return i.id !== editingItem.itemId; }),
+        amount
+      ),
+      error: null
+    };
+  } else {
+    result = computeShares(amount, itemModalMode, people, itemModalInputs);
+  }
+
+  const shareFor = function (person) {
+    return result.error ? 0 : (result.splits[person] || 0);
+  };
+
+  if (itemModalMode === 'proportional') {
+    const names = Object.keys(result.splits);
+    box.innerHTML = names.length
+      ? names.map(function (person) {
+          return '<span class="inline-flex items-center gap-1 px-2 py-1 rounded-lg border bg-indigo-50 border-indigo-200 text-[11px] text-indigo-900">' +
+            esc(person === state.userName ? 'You' : person) +
+            ' <b>' + money(shareFor(person)) + '</b></span>';
+        }).join('')
+      : '<span class="text-[10px] text-gray-400">Add a normal item to this bill first.</span>';
+  } else {
+    box.innerHTML = state.participants.map(function (person, idx) {
+      const on = itemModalPeople.has(person);
+      return '<label class="inline-flex items-center gap-1.5 px-2 py-1 rounded-lg border text-xs font-medium cursor-pointer select-none ' +
+        (on ? 'bg-indigo-50 border-indigo-300 text-indigo-900' : 'bg-white border-gray-200 text-gray-500') + '">' +
+        '<input type="checkbox" ' + (on ? 'checked' : '') + ' onchange="toggleItemPerson(' + idx + ', this.checked)" class="w-3.5 h-3.5 text-indigo-600 rounded border-gray-300">' +
+        '<span>' + esc(person) + '</span>' +
+        (on ? '<span class="text-[10px] text-indigo-600 font-bold">' + money(shareFor(person)) + '</span>' : '') +
+      '</label>';
+    }).join('');
+  }
+
+  const inputsBox = $('item-split-inputs');
+  if (inputsBox) {
+    if (itemModalMode === 'equal') {
+      inputsBox.innerHTML = '';
+    } else if (itemModalMode === 'proportional') {
+      inputsBox.innerHTML = '<p class="text-[10px] text-gray-500">Each person pays the same proportion of this row as their share of the bill&apos;s normal items. Switch mode to override.</p>';
+    } else {
+      const unit = itemModalMode === 'percent' ? '%' : (itemModalMode === 'custom' ? state.currency : '×');
+      inputsBox.innerHTML = people.map(function (person) {
+        const idx = state.participants.indexOf(person);
+        const raw = itemModalInputs[person];
+        const value = raw === undefined || raw === '' ? '' : round2(raw);
+        return '<div class="flex items-center gap-2 bg-white border border-gray-200 rounded-lg px-2 py-1">' +
+          '<span class="text-[11px] text-gray-600 flex-1 min-w-0 truncate">' + esc(person) + '</span>' +
+          '<input type="number" step="0.01" inputmode="decimal" value="' + value + '" onchange="updateItemSplitInput(' + idx + ', this.value)" class="w-20 border border-gray-300 rounded px-1.5 py-0.5 text-xs text-right outline-none focus:border-indigo-400">' +
+          '<span class="text-[10px] text-gray-400 w-4">' + unit + '</span>' +
+          '<span class="text-[10px] font-semibold text-indigo-600 w-16 text-right">' + money(shareFor(person)) + '</span>' +
+        '</div>';
+      }).join('');
+    }
+  }
+
+  const errorBox = $('item-split-error');
+  if (errorBox) {
+    errorBox.textContent = result.error || '';
+    errorBox.classList.toggle('hide', !result.error);
+  }
 }
 
 function toggleItemPerson(index, checked) {
   const person = state.participants[index];
   if (!person) return;
-  if (checked) itemModalPeople.add(person);
-  else itemModalPeople.delete(person);
-  renderItemModalChips();
+  if (checked) {
+    itemModalPeople.add(person);
+    if (itemModalMode !== 'equal' && itemModalMode !== 'proportional' && itemModalInputs[person] === undefined) {
+      itemModalInputs[person] = itemModalMode === 'weighted' ? 1 : 0;
+    }
+  } else {
+    itemModalPeople.delete(person);
+  }
+  renderItemSplitEditor();
 }
 
 function setItemModalPeople(on) {
-  itemModalPeople = new Set(on ? state.participants.slice() : []);
-  renderItemModalChips();
+  const amount = parseFloat($('item-modal-amount').value) || 0;
+  if (on) {
+    itemModalPeople = new Set(state.participants);
+    if (itemModalMode !== 'equal' && itemModalMode !== 'proportional') {
+      itemModalInputs = seedSplitInputs(itemModalMode, itemModalPeople, amount);
+    }
+  } else {
+    itemModalPeople = new Set();
+  }
+  renderItemSplitEditor();
+}
+
+function setItemSplitMode(index) {
+  const next = splitModeName(index);
+  if (!editingItem || next === itemModalMode) return;
+
+  const amount = parseFloat($('item-modal-amount').value) || 0;
+  const people = Array.from(itemModalPeople);
+
+  let currentSplits = {};
+  if (itemModalMode === 'proportional') {
+    currentSplits = proportionalSplitsForAmount(
+      itemsOfProject(editingItem.projectId).filter(function (i) { return i.id !== editingItem.itemId; }),
+      amount
+    );
+  } else {
+    const current = computeShares(amount, itemModalMode, people, itemModalInputs);
+    if (!current.error) currentSplits = current.splits;
+  }
+
+  itemModalCache[itemModalMode] = Object.assign({}, itemModalInputs);
+  itemModalMode = next;
+
+  if (next === 'equal' || next === 'proportional') {
+    itemModalInputs = {};
+  } else if (itemModalCache[next] && Object.keys(itemModalCache[next]).length) {
+    itemModalInputs = Object.assign({}, itemModalCache[next]);
+  } else {
+    itemModalInputs = deriveInputs(next, people, currentSplits, amount);
+  }
+
+  renderItemSplitEditor();
+}
+
+function updateItemSplitInput(index, value) {
+  const person = state.participants[index];
+  if (!person) return;
+  itemModalInputs[person] = value === '' ? '' : Number(value);
+  renderItemSplitEditor();
+}
+
+async function recomputeBillProportional(projectId) {
+  const own = itemsOfProject(projectId);
+  for (const item of own) {
+    if (item.splitMethod !== 'proportional') continue;
+    item.splits = proportionalSplitsForAmount(own, item.amount);
+    await dbPut(STORE_ITEMS, item);
+  }
 }
 
 async function saveItemModal(event) {
@@ -1058,7 +1450,20 @@ async function saveItemModal(event) {
 
   if (!desc) return alert('Give the item a name.');
   if (!isFinite(amount) || amount === 0) return alert('Enter a non-zero amount.');
-  if (!people.length) return alert('Tick at least one person for this item.');
+
+  let result;
+  if (itemModalMode === 'proportional') {
+    result = {
+      splits: proportionalSplitsForAmount(
+        itemsOfProject(project.id).filter(function (i) { return i.id !== editingItem.itemId; }),
+        amount
+      ),
+      error: null
+    };
+  } else {
+    result = computeShares(amount, itemModalMode, people, itemModalInputs);
+  }
+  if (result.error) return alert(result.error);
 
   try {
     project.categories = project.categories || [];
@@ -1071,12 +1476,17 @@ async function saveItemModal(event) {
       ? items.find(function (i) { return i.id === editingItem.itemId; })
       : null;
 
+    const splitInputs = (itemModalMode === 'equal' || itemModalMode === 'proportional')
+      ? {}
+      : pickInputs(itemModalInputs, people);
+
     if (item) {
       item.description = desc;
       item.amount = amount;
       item.category = category;
-      item.splits = equalSplits(amount, people);
-      item.splitMethod = 'equal';
+      item.splitMethod = itemModalMode;
+      item.splitInputs = splitInputs;
+      item.splits = result.splits;
       await dbPut(STORE_ITEMS, item);
     } else {
       item = {
@@ -1088,8 +1498,9 @@ async function saveItemModal(event) {
         category: category,
         amount: amount,
         paidBy: project.payer,
-        splitMethod: 'equal',
-        splits: equalSplits(amount, people),
+        splitMethod: itemModalMode,
+        splitInputs: splitInputs,
+        splits: result.splits,
         settled: false,
         attachments: []
       };
@@ -1097,6 +1508,7 @@ async function saveItemModal(event) {
       items.push(item);
     }
 
+    await recomputeBillProportional(project.id);
     closeItemModal();
     updateAllViews();
   } catch (err) {
@@ -1257,7 +1669,9 @@ function itemRowHtml(item) {
       '<div class="min-w-0">' +
         '<p class="text-sm font-semibold text-gray-800 break-words ' + (settled ? 'line-through decoration-gray-300' : '') + '">' +
           esc(item.description) + '</p>' +
-        '<p class="mt-0.5"><span class="bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded text-[10px]">' + esc(item.category) + '</span></p>' +
+        '<p class="mt-0.5"><span class="bg-gray-100 text-gray-600 px-1.5 py-0.5 rounded text-[10px]">' + esc(item.category) + '</span>' +
+          (splitModeLabel(item.splitMethod) ? '<span class="ml-1 text-[9px] uppercase tracking-wide text-indigo-500 font-semibold">' + splitModeLabel(item.splitMethod) + '</span>' : '') +
+        '</p>' +
       '</div>' +
       '<p class="font-mono text-sm font-bold flex-shrink-0 ' + amountClass + '">' + money(item.amount) + '</p>' +
     '</div>' +
@@ -1311,6 +1725,8 @@ async function deleteItem(itemId) {
     await dbDelete(STORE_PROJECTS, item.projectId);
     projects = projects.filter(function (p) { return p.id !== item.projectId; });
     expandedProjectIds.delete(item.projectId);
+  } else {
+    await recomputeBillProportional(item.projectId);
   }
   updateAllViews();
 }
@@ -1688,7 +2104,7 @@ function csvCell(value) {
 function exportToCSV() {
   if (!items.length) return alert('No bills to export yet.');
 
-  const header = ['Bill', 'Date', 'Item', 'Category', 'Amount', 'Paid By', 'Settled']
+  const header = ['Bill', 'Date', 'Item', 'Category', 'Amount', 'Paid By', 'Split', 'Settled']
     .concat(state.participants.map(function (p) { return p + ' Share'; }));
 
   const rows = [header.map(csvCell).join(',')];
@@ -1702,6 +2118,7 @@ function exportToCSV() {
       item.category,
       (Number(item.amount) || 0).toFixed(2),
       item.paidBy,
+      item.splitMethod || 'equal',
       item.settled ? 'Yes' : 'No'
     ].concat(state.participants.map(function (p) {
       return ((item.splits && Number(item.splits[p])) || 0).toFixed(2);
@@ -1884,27 +2301,80 @@ function handleModalCSVFileUpload(event) {
 function parseImportText() {
   const textarea = $('csv-paste-input');
   const parsed = parseBillCSV(textarea ? textarea.value : '');
+
   importBills = parsed.bills.map(function (bill) {
     return {
       name: (bill.name || '').trim() || ('Bill ' + bill.date),
       date: bill.date,
       items: bill.items.map(function (it) {
-        const names = it.splitWith.map(canonicalParticipant).filter(Boolean);
+        const tokens = (it.splitWith || []).map(parseSplitToken).filter(Boolean);
+        const names = [];
+        tokens.forEach(function (token) {
+          const name = canonicalParticipant(token.name);
+          if (name && !names.some(function (existing) { return samePerson(existing, name); })) names.push(name);
+        });
+
+        const splitInputs = {};
+        let splitMethod = 'equal';
+        if (tokens.some(function (token) { return token.kind === 'percent'; })) {
+          splitMethod = 'percent';
+          tokens.forEach(function (token) {
+            const name = canonicalParticipant(token.name);
+            if (name) splitInputs[name] = token.kind === 'percent' && token.value !== null ? token.value : 0;
+          });
+        } else if (tokens.some(function (token) { return token.kind === 'weight'; })) {
+          splitMethod = 'weighted';
+          tokens.forEach(function (token) {
+            const name = canonicalParticipant(token.name);
+            if (name) splitInputs[name] = token.value === null ? 1 : token.value;
+          });
+        }
+
+        if (!tokens.length && detectItemKind(it.description, it.category) !== 'item') {
+          splitMethod = 'proportional';
+        }
+
         return {
           description: it.description,
           category: it.category,
           amount: it.amount,
-          mode: names.length ? 'custom' : 'default',
-          people: names
+          peopleMode: names.length ? 'custom' : 'default',
+          people: names,
+          splitMethod: splitMethod,
+          splitInputs: splitInputs,
+          inputsTouched: Object.keys(splitInputs).length > 0
         };
       })
     };
   });
+
   renderImportPreview();
 }
 
 function effectiveImportPeople(item) {
-  return item.mode === 'default' ? importDefaultParticipants.slice() : item.people.slice();
+  return item.peopleMode === 'default' ? importDefaultParticipants.slice() : item.people.slice();
+}
+
+function refreshImportInputs(item) {
+  if (item.splitMethod === 'equal' || item.splitMethod === 'proportional') {
+    item.splitInputs = {};
+    item.inputsTouched = false;
+    return;
+  }
+
+  const people = uniquePeople(effectiveImportPeople(item));
+  if (!item.splitInputs) item.splitInputs = {};
+
+  if (!item.inputsTouched) {
+    item.splitInputs = seedSplitInputs(item.splitMethod, people, item.amount);
+    return;
+  }
+
+  people.forEach(function (person) {
+    if (item.splitInputs[person] === undefined) {
+      item.splitInputs[person] = item.splitMethod === 'weighted' ? 1 : 0;
+    }
+  });
 }
 
 function updateImportBillName(index, value) {
@@ -1918,15 +2388,16 @@ function toggleImportPerson(billIndex, itemIndex, personIndex, checked) {
   const person = state.participants[personIndex];
   if (!item || !person) return;
 
-  if (item.mode === 'default') {
+  if (item.peopleMode === 'default') {
     item.people = importDefaultParticipants.slice();
-    item.mode = 'custom';
+    item.peopleMode = 'custom';
   }
   if (checked) {
     if (!item.people.some(function (p) { return samePerson(p, person); })) item.people.push(person);
   } else {
     item.people = item.people.filter(function (p) { return !samePerson(p, person); });
   }
+  refreshImportInputs(item);
   renderImportPreview();
 }
 
@@ -1934,9 +2405,40 @@ function setImportBillPeople(billIndex, on) {
   const bill = importBills[billIndex];
   if (!bill) return;
   bill.items.forEach(function (item) {
-    item.mode = 'custom';
+    item.peopleMode = 'custom';
     item.people = on ? state.participants.slice() : [];
+    refreshImportInputs(item);
   });
+  renderImportPreview();
+}
+
+function setImportSplitMode(billIndex, itemIndex, modeIndex) {
+  const bill = importBills[billIndex];
+  const item = bill && bill.items[itemIndex];
+  if (!item) return;
+
+  const method = splitModeName(modeIndex);
+  if (item.splitMethod === method) return;
+
+  item.splitMethod = method;
+  item.inputsTouched = false;
+  item.splitInputs = (method === 'equal' || method === 'proportional')
+    ? {}
+    : seedSplitInputs(method, effectiveImportPeople(item), item.amount);
+  renderImportPreview();
+}
+
+function setImportSplitInput(billIndex, itemIndex, personIndex, value) {
+  const bill = importBills[billIndex];
+  const item = bill && bill.items[itemIndex];
+  if (!item) return;
+
+  const person = effectiveImportPeople(item)[personIndex];
+  if (!person) return;
+
+  item.splitInputs = item.splitInputs || {};
+  item.splitInputs[person] = value === '' ? 0 : Number(value);
+  item.inputsTouched = true;
   renderImportPreview();
 }
 
@@ -1952,6 +2454,14 @@ function renderImportDefaultChips() {
   }).join('');
 }
 
+function refreshDefaultPeopleInputs() {
+  importBills.forEach(function (bill) {
+    bill.items.forEach(function (item) {
+      if (item.peopleMode === 'default') refreshImportInputs(item);
+    });
+  });
+}
+
 function toggleImportDefault(personIndex, checked) {
   const person = state.participants[personIndex];
   if (!person) return;
@@ -1962,14 +2472,72 @@ function toggleImportDefault(personIndex, checked) {
   } else {
     importDefaultParticipants = importDefaultParticipants.filter(function (p) { return !samePerson(p, person); });
   }
+  refreshDefaultPeopleInputs();
   renderImportDefaultChips();
   renderImportPreview();
 }
 
 function setImportDefaultPeople(on) {
   importDefaultParticipants = on ? state.participants.slice() : [];
+  refreshDefaultPeopleInputs();
   renderImportDefaultChips();
   renderImportPreview();
+}
+
+function sharesForImportItems(canonicalItems) {
+  const results = canonicalItems.map(function (item) {
+    if (item.splitMethod === 'proportional') return null;
+    return computeShares(item.amount, item.splitMethod, item.people, item.splitInputs);
+  });
+
+  const base = [];
+  canonicalItems.forEach(function (item, idx) {
+    if (item.splitMethod === 'proportional') return;
+    const result = results[idx];
+    if (!result || result.error) return;
+    base.push({ amount: item.amount, splits: Object.assign({}, result.splits) });
+  });
+
+  canonicalItems.forEach(function (item, idx) {
+    if (item.splitMethod !== 'proportional') return;
+    results[idx] = { splits: proportionalSplitsForAmount(base, item.amount), error: null };
+  });
+
+  return results;
+}
+
+function canonicalImportItems(bill, known) {
+  return bill.items.map(function (source) {
+    const people = effectiveImportPeople(source).map(function (raw) {
+      const key = String(raw).toLowerCase();
+      return known ? (known.get(key) || String(raw)) : String(raw);
+    });
+
+    const inputs = {};
+    Object.keys(source.splitInputs || {}).forEach(function (key) {
+      const mapped = known ? (known.get(String(key).toLowerCase()) || String(key)) : String(key);
+      inputs[mapped] = source.splitInputs[key];
+    });
+
+    return {
+      description: source.description,
+      category: source.category,
+      amount: source.amount,
+      splitMethod: source.splitMethod,
+      splitInputs: inputs,
+      people: people
+    };
+  });
+}
+
+function importModeButtons(billIndex, itemIndex, method) {
+  return '<div class="flex bg-gray-100 rounded-md p-0.5 gap-0.5 mt-1.5 w-fit">' +
+    SPLIT_MODE_NAMES.map(function (name, idx) {
+      const on = name === method;
+      return '<button type="button" onclick="setImportSplitMode(' + billIndex + ', ' + itemIndex + ', ' + idx + ')" ' +
+        'class="px-1.5 py-0.5 rounded text-[9px] font-semibold ' +
+        (on ? 'bg-white shadow text-indigo-700' : 'text-gray-500') + '">' + SPLIT_MODE_LABELS[idx] + '</button>';
+    }).join('') + '</div>';
 }
 
 function renderImportPreview() {
@@ -1993,6 +2561,18 @@ function renderImportPreview() {
   let html = '';
 
   importBills.forEach(function (bill, billIndex) {
+    const canonical = bill.items.map(function (item) {
+      return {
+        amount: item.amount,
+        splitMethod: item.splitMethod,
+        splitInputs: item.splitInputs || {},
+        people: effectiveImportPeople(item),
+        description: item.description,
+        category: item.category
+      };
+    });
+    const results = sharesForImportItems(canonical);
+
     html += '<div class="border border-gray-200 rounded-xl bg-white overflow-hidden mb-2">' +
       '<div class="flex items-center gap-2 p-2.5 bg-gray-50 border-b border-gray-200">' +
         '<input value="' + esc(bill.name) + '" oninput="updateImportBillName(' + billIndex + ', this.value)" ' +
@@ -2007,44 +2587,98 @@ function renderImportPreview() {
       '<div class="divide-y divide-gray-100">';
 
     bill.items.forEach(function (item, itemIndex) {
-      const people = effectiveImportPeople(item);
-      const share = people.length ? item.amount / people.length : 0;
+      const people = canonical[itemIndex].people;
+      const result = results[itemIndex];
+      const splits = result.splits || {};
+      const isValid = !result.error;
+      const kind = detectItemKind(item.description, item.category);
+      const kindTag = kind === 'tax'
+        ? '<span class="ml-1 bg-amber-50 text-amber-700 border border-amber-200 px-1 py-0.5 rounded text-[9px] font-bold uppercase">Tax</span>'
+        : (kind === 'discount'
+          ? '<span class="ml-1 bg-emerald-50 text-emerald-700 border border-emerald-200 px-1 py-0.5 rounded text-[9px] font-bold uppercase">Discount</span>'
+          : '');
+
       itemCount += 1;
       grandTotal += item.amount;
-      people.forEach(function (person) {
-        personTotals[person] = (personTotals[person] || 0) + share;
-      });
+      if (isValid) {
+        Object.keys(splits).forEach(function (person) {
+          personTotals[person] = (personTotals[person] || 0) + (Number(splits[person]) || 0);
+        });
+      }
 
-      const extraPeople = people.filter(function (person) {
-        return !state.participants.some(function (p) { return samePerson(p, person); });
-      });
+      const shareFor = function (person) {
+        return isValid ? (Number(splits[person]) || 0) : 0;
+      };
 
-      const chips = state.participants.map(function (person, personIndex) {
-        const on = people.some(function (p) { return samePerson(p, person); });
-        return '<label class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] font-medium cursor-pointer select-none ' +
-          (on ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-white border-gray-200 text-gray-400') + '">' +
-          '<input type="checkbox" ' + (on ? 'checked' : '') +
-            ' onchange="toggleImportPerson(' + billIndex + ', ' + itemIndex + ', ' + personIndex + ', this.checked)" ' +
-            'class="w-3 h-3 text-indigo-600 rounded border-gray-300">' +
-          '<span>' + esc(person === state.userName ? 'You' : person) + '</span>' +
-          (on ? '<b>' + money(share) + '</b>' : '') +
-        '</label>';
-      }).join('');
+      let chips = '';
+      if (item.splitMethod === 'proportional') {
+        const names = Object.keys(splits);
+        chips = names.length
+          ? names.map(function (person) {
+              return '<span class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border bg-indigo-50 border-indigo-200 text-[10px] text-indigo-800">' +
+                esc(person === state.userName ? 'You' : person) + ' <b>' + money(shareFor(person)) + '</b></span>';
+            }).join('')
+          : '<span class="text-[10px] text-gray-400">No normal items yet - this will split equally.</span>';
+      } else {
+        chips = state.participants.map(function (person, personIndex) {
+          const on = people.some(function (p) { return samePerson(p, person); });
+          return '<label class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border text-[10px] font-medium cursor-pointer select-none ' +
+            (on ? 'bg-indigo-50 border-indigo-200 text-indigo-800' : 'bg-white border-gray-200 text-gray-400') + '">' +
+            '<input type="checkbox" ' + (on ? 'checked' : '') +
+              ' onchange="toggleImportPerson(' + billIndex + ', ' + itemIndex + ', ' + personIndex + ', this.checked)" ' +
+              'class="w-3 h-3 text-indigo-600 rounded border-gray-300">' +
+            '<span>' + esc(person === state.userName ? 'You' : person) + '</span>' +
+            (on ? '<b>' + money(shareFor(person)) + '</b>' : '') +
+          '</label>';
+        }).join('');
+      }
+
+      let inputRows = '';
+      if (item.splitMethod === 'weighted' || item.splitMethod === 'percent' || item.splitMethod === 'custom') {
+        const unit = item.splitMethod === 'percent' ? '%' : (item.splitMethod === 'custom' ? state.currency : '×');
+        inputRows = people.map(function (person, personIndex) {
+          const raw = item.splitInputs ? item.splitInputs[person] : undefined;
+          const fallback = item.splitMethod === 'weighted' ? 1 : 0;
+          const value = raw === undefined || raw === '' ? fallback : round2(raw);
+          return '<div class="flex items-center gap-1.5 mt-1">' +
+            '<span class="text-[10px] text-gray-600 flex-1 min-w-0 truncate">' + esc(person === state.userName ? 'You' : person) + '</span>' +
+            '<input type="number" step="0.01" inputmode="decimal" value="' + value + '" ' +
+              'onchange="setImportSplitInput(' + billIndex + ', ' + itemIndex + ', ' + personIndex + ', this.value)" ' +
+              'class="w-16 border border-gray-300 rounded px-1 py-0.5 text-[10px] text-right outline-none focus:border-indigo-400">' +
+            '<span class="text-[9px] text-gray-400 w-3">' + unit + '</span>' +
+            '<span class="text-[9px] font-semibold text-indigo-600 w-14 text-right">' + (isValid ? money(shareFor(person)) : '-') + '</span>' +
+          '</div>';
+        }).join('');
+      }
+
+      const extraPeople = (item.splitMethod === 'proportional' ? Object.keys(splits) : people)
+        .filter(function (person) {
+          return !state.participants.some(function (p) { return samePerson(p, person); });
+        });
+
+      const modeNote = item.splitMethod === 'proportional'
+        ? '<p class="text-[9px] text-indigo-700 bg-indigo-50/70 rounded px-1.5 py-1 mt-1">Bill ratio: each person pays the same proportion as their share of the other items. Switch mode to override.</p>'
+        : '';
 
       html += '<div class="p-2.5">' +
         '<div class="flex items-start justify-between gap-2">' +
           '<div class="min-w-0">' +
-            '<p class="text-sm font-semibold text-gray-800 break-words">' + esc(item.description) + '</p>' +
+            '<p class="text-sm font-semibold text-gray-800 break-words">' + esc(item.description) + kindTag + '</p>' +
             '<p class="text-[10px] text-gray-500">' + esc(item.category) + '</p>' +
           '</div>' +
           '<p class="font-mono text-sm font-bold text-indigo-600 whitespace-nowrap">' + money(item.amount) + '</p>' +
         '</div>' +
+        importModeButtons(billIndex, itemIndex, item.splitMethod) +
         '<div class="flex flex-wrap gap-1 mt-1.5">' + chips + '</div>' +
+        inputRows +
+        modeNote +
+        (result.error ? '<p class="text-[10px] text-red-500 mt-1">' + esc(result.error) + '</p>' : '') +
         (extraPeople.length
-          ? '<p class="text-[10px] text-amber-600 mt-1">Will add new participant(s): ' +
-            extraPeople.map(esc).join(', ') + '</p>'
+          ? '<p class="text-[10px] text-amber-600 mt-1">Will add new participant(s): ' + extraPeople.map(esc).join(', ') + '</p>'
           : '') +
-        (people.length ? '' : '<p class="text-[10px] text-red-500 mt-1">Nobody selected - this item cannot import.</p>') +
+        (item.splitMethod !== 'proportional' && !people.length
+          ? '<p class="text-[10px] text-red-500 mt-1">Nobody selected - this item cannot import.</p>'
+          : '') +
       '</div>';
     });
 
@@ -2077,7 +2711,7 @@ async function executeImport() {
   for (const bill of importBills) {
     if (!String(bill.name || '').trim()) return alert('Every bill needs a name.');
     for (const item of bill.items) {
-      if (!effectiveImportPeople(item).length) {
+      if (item.splitMethod !== 'proportional' && !effectiveImportPeople(item).length) {
         return alert('Pick at least one person for "' + item.description + '".');
       }
     }
@@ -2089,7 +2723,10 @@ async function executeImport() {
     const additions = [];
     importBills.forEach(function (bill) {
       bill.items.forEach(function (item) {
-        effectiveImportPeople(item).forEach(function (raw) {
+        const names = item.splitMethod === 'proportional'
+          ? state.participants.slice()
+          : effectiveImportPeople(item);
+        names.forEach(function (raw) {
           const name = String(raw).trim();
           if (!name) return;
           const key = name.toLowerCase();
@@ -2110,9 +2747,26 @@ async function executeImport() {
     const newProjectIds = [];
     let imported = 0;
 
-    for (const bill of importBills) {
+    const prepared = importBills.map(function (bill) {
+      const canonical = canonicalImportItems(bill, known);
+      return { bill: bill, canonical: canonical, results: sharesForImportItems(canonical) };
+    });
+
+    for (const entry of prepared) {
+      for (let i = 0; i < entry.canonical.length; i += 1) {
+        if (entry.results[i].error) {
+          return alert('"' + entry.canonical[i].description + '": ' + entry.results[i].error);
+        }
+      }
+    }
+
+    for (const entry of prepared) {
+      const bill = entry.bill;
+      const canonical = entry.canonical;
+      const results = entry.results;
+
       const projectId = uid();
-      const categories = Array.from(new Set(bill.items.map(function (it) { return it.category; }).filter(Boolean)));
+      const categories = Array.from(new Set(canonical.map(function (it) { return it.category; }).filter(Boolean)));
       if (!categories.length) categories.push('Uncategorised');
 
       const project = {
@@ -2128,11 +2782,8 @@ async function executeImport() {
       projects.push(project);
       newProjectIds.push(projectId);
 
-      for (let i = 0; i < bill.items.length; i += 1) {
-        const source = bill.items[i];
-        const people = effectiveImportPeople(source).map(function (raw) {
-          return known.get(String(raw).toLowerCase()) || String(raw);
-        });
+      for (let i = 0; i < canonical.length; i += 1) {
+        const source = canonical[i];
         const item = {
           id: uid(),
           projectId: projectId,
@@ -2142,8 +2793,9 @@ async function executeImport() {
           category: source.category,
           amount: source.amount,
           paidBy: payer,
-          splitMethod: 'equal',
-          splits: equalSplits(source.amount, people),
+          splitMethod: source.splitMethod,
+          splitInputs: source.splitMethod === 'equal' || source.splitMethod === 'proportional' ? {} : source.splitInputs,
+          splits: results[i].splits,
           settled: false,
           attachments: []
         };
@@ -2162,6 +2814,7 @@ async function executeImport() {
     alert('Import failed: ' + err.message);
   }
 }
+
 
 function toggleTransparency() {
   const box = $('transparency-box');
@@ -2185,6 +2838,12 @@ if (typeof module !== 'undefined' && module.exports) {
     parseAmount: parseAmount,
     splitNameList: splitNameList,
     equalSplits: equalSplits,
+    computeShares: computeShares,
+    parseSplitToken: parseSplitToken,
+    detectItemKind: detectItemKind,
+    proportionalSplitsForAmount: proportionalSplitsForAmount,
+    distributePercent: distributePercent,
+    distributeAmount: distributeAmount,
     toDateOnly: toDateOnly
   };
 }
